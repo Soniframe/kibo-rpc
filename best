@@ -1,0 +1,1519 @@
+package jp.jaxa.iss.kibo.rpc.rmc;
+
+import android.graphics.Bitmap;
+import android.graphics.BitmapFactory;
+import android.util.Log;
+import android.graphics.Canvas;
+import android.graphics.Color;
+import android.graphics.Paint;
+import android.graphics.RectF;
+import android.os.SystemClock;
+
+import jp.jaxa.iss.kibo.rpc.api.KiboRpcService;
+import gov.nasa.arc.astrobee.Result;
+import gov.nasa.arc.astrobee.Kinematics;
+
+import java.io.File;
+import java.io.FileOutputStream;
+import java.io.InputStream;
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+import java.util.HashMap;
+import java.util.Arrays;
+import java.util.Objects;
+import java.util.Collections;
+import java.util.Comparator;
+
+import gov.nasa.arc.astrobee.types.Point;
+import gov.nasa.arc.astrobee.types.Quaternion;
+
+import org.opencv.aruco.Aruco;
+import org.opencv.aruco.Dictionary;
+import org.opencv.calib3d.Calib3d;
+import org.opencv.core.Core;
+import org.opencv.core.CvException;
+import org.opencv.core.CvType;
+import org.opencv.core.Mat;
+import org.opencv.core.Size;
+import org.opencv.core.Rect;
+import org.opencv.core.MatOfPoint2f;
+import org.opencv.imgproc.Imgproc;
+import org.opencv.android.Utils;
+import org.opencv.core.MatOfPoint;
+
+// TensorFlow Lite imports (Requires Gradle dependencies in app/build.gradle)
+import org.tensorflow.lite.support.image.TensorImage;
+import org.tensorflow.lite.task.vision.detector.Detection;
+import org.tensorflow.lite.task.vision.detector.ObjectDetector;
+
+
+/**
+ * Class meant to handle commands from the Ground Data System and execute them in Astrobee.
+ */
+
+public class YourService extends KiboRpcService {
+
+    private final String TAG = this.getClass().getSimpleName();
+
+    // The labels your TFLite model is expected to output.
+    // Make sure this array matches the labels used in your .tflite model.
+    private final String[] TFLITE_LABELS = {
+            "book", "goggle", "electric_fan", "beaker", "screwdriver",
+            "watch", "plastic_bottle", "pen", "resin", "spatula",
+            "cup", "top", "tape", "P", "Q", "R", "S", "U", "V", "W", "X", "Y", "Z"
+    };
+
+    // Dictionaries for Astrobee's movement points and orientations.
+    private Map<Integer, Point> coordinateDictionary = new HashMap<>();
+    private Map<Integer, Quaternion> quaternionOrientations = new HashMap<>();
+
+    public YourService() {
+        // Initialize coordinate and orientation dictionaries based on the provided values.
+        coordinateDictionary.put(1, new Point(10.66, -9.79, 4.905)); // Area 1
+        coordinateDictionary.put(2, new Point(10.91, -8.875, 4.55)); // Area 2
+        coordinateDictionary.put(3, new Point(10.535, -7.88, 4.55)); // Area 3
+        coordinateDictionary.put(4, new Point(10.66, -6.8525, 4.95)); // Area 4
+        coordinateDictionary.put(5, new Point(10.91, -7.925, 4.55)); // Intermediate point (often for astronaut)
+        coordinateDictionary.put(10, new Point(11.005, -6.808, 4.965)); // Astronaut's vicinity
+        coordinateDictionary.put(99, new Point(10.785, -9.25, 4.65)); // Another reference point
+
+        quaternionOrientations.put(1, new Quaternion(-0.009f, -0.224f, -0.455f, 0.862f));
+        quaternionOrientations.put(2, new Quaternion(0.000f, 0.707f, 0.000f, 0.707f));
+        quaternionOrientations.put(3, new Quaternion(0f, 0.609f, 0f, 0.793f));
+        quaternionOrientations.put(4, new Quaternion(0.009f, -0.001f, -0.996f, 0.087f));
+        quaternionOrientations.put(5, new Quaternion(0f, 0.609f, 0f, 0.793f));
+        quaternionOrientations.put(10, new Quaternion(0f, 0f, -0.707f, 0.707f));
+        quaternionOrientations.put(11, new Quaternion(-0.105f, 0.000f, -0.995f, 0f));
+    }
+
+
+    @Override
+    protected void runPlan1() {
+        Log.i(TAG, "runPlan1 started.");
+
+        // Constants for API call retries
+        final int LOOP_MAX = 5;
+        int loopCounter;
+        Result result;
+
+        // List to store prediction results for each area (item name, item count)
+        List<List<Object>> predictionOutput = new ArrayList<>();
+
+        // Initial image capture to confirm camera functionality.
+        Mat initialImage = api.getMatNavCam();
+        if (initialImage == null || initialImage.empty()) {
+            Log.e(TAG, "Failed to get NavCam image at mission start. Aborting.");
+            return;
+        } else {
+            Log.i(TAG, "Initial NavCam image captured (size: " + initialImage.width() + "x" + initialImage.height() + ").");
+            initialImage.release(); // Release the Mat as it's not needed further.
+        }
+
+        api.startMission();
+        Log.i(TAG, "Mission started.");
+
+        /* --- Patrol and Recognition for Areas 1, 2, 3, 4 --- */
+        int[] patrolAreas = {1, 2, 3, 4}; // Order of areas to visit
+
+        for (int areaId : patrolAreas) {
+            Log.i(TAG, "--------------------------------------------------");
+            Log.i(TAG, "Processing Area: " + areaId);
+            Log.i(TAG, "--------------------------------------------------");
+
+            Point currentAreaPoint = coordinateDictionary.get(areaId);
+            Quaternion currentAreaQuaternion = quaternionOrientations.get(areaId);
+
+            if (currentAreaPoint == null || currentAreaQuaternion == null) {
+                Log.e(TAG, "Coordinates or orientation missing for Area: " + areaId + ". Skipping.");
+                api.setAreaInfo(areaId, "unknown", 0);
+                continue;
+            }
+
+            Log.i(TAG, "Moving to Area " + areaId + " at " + currentAreaPoint.toString());
+            loopCounter = 0;
+            result = api.moveTo(currentAreaPoint, currentAreaQuaternion, false);
+            while (!result.hasSucceeded() && loopCounter < LOOP_MAX) {
+                Log.w(TAG, "Move to Area " + areaId + " failed, retrying... Attempt " + (loopCounter + 1));
+                result = api.moveTo(currentAreaPoint, currentAreaQuaternion, false);
+                SystemClock.sleep(500);
+                loopCounter++;
+            }
+
+            if (!result.hasSucceeded()) {
+                Log.e(TAG, "Failed to move to Area " + areaId + " after " + LOOP_MAX + " retries. Skipping recognition.");
+                api.setAreaInfo(areaId, "unknown", 0);
+                continue;
+            }
+            Log.i(TAG, "Successfully moved to Area " + areaId + ".");
+
+            // Perform AR detection and cropping to get the image for item recognition.
+            Log.i(TAG, "Starting AR detection for Area " + areaId + ".");
+            ARResult arResult = AR_cropping(areaId, 0); // 0 for normal mode
+
+            if (arResult.arComplete == 0) {
+                Log.w(TAG, "AR detection and cropping failed for Area " + areaId + ". Item recognition might fail.");
+            }
+
+            // Perform item recognition using TFLite on the cropped image.
+            try {
+                List<Object> currentAreaPrediction = wrapper_predict(areaId);
+                predictionOutput.add(currentAreaPrediction); // Add [itemName, itemCount] to list
+            } catch (IOException e) {
+                Log.e(TAG, "Error during TFLite prediction for Area " + areaId + ": " + e.getMessage());
+                // FIX: Explicitly cast to Object to resolve type inference issue with Arrays.asList
+                predictionOutput.add(Arrays.asList((Object)"Error", (Object)0));
+            }
+
+
+            // Report the recognized item and its count to the API.
+            int currentOutputIndex = predictionOutput.size() - 1;
+            if (currentOutputIndex >= 0 && predictionOutput.get(currentOutputIndex) != null && predictionOutput.get(currentOutputIndex).size() >= 2) {
+                String itemName = (String) predictionOutput.get(currentOutputIndex).get(0);
+                Integer itemCount = (Integer) predictionOutput.get(currentOutputIndex).get(1);
+                api.setAreaInfo(areaId, itemName, itemCount);
+                Log.i(TAG, "Area " + areaId + " info set: Item: " + itemName + ", Count: " + itemCount);
+            } else {
+                Log.e(TAG, "Invalid prediction output for Area " + areaId + ". Setting default info.");
+                api.setAreaInfo(areaId, "unknown", 0);
+            }
+        }
+
+        /* --- Report Rounding Completion and Move to Astronaut --- */
+        Point astronautPoint = coordinateDictionary.get(10); // Astronaut's location
+        Quaternion astronautQuaternion = quaternionOrientations.get(10); // Orientation towards astronaut
+
+        Log.i(TAG, "Moving to astronaut's position for rounding completion.");
+        loopCounter = 0;
+        result = api.moveTo(astronautPoint, astronautQuaternion, false);
+        while (!result.hasSucceeded() && loopCounter < LOOP_MAX) {
+            Log.w(TAG, "Move to astronaut failed, retrying... Attempt " + (loopCounter + 1));
+            result = api.moveTo(astronautPoint, astronautQuaternion, false);
+            SystemClock.sleep(500);
+            loopCounter++;
+        }
+        if (!result.hasSucceeded()) {
+            Log.e(TAG, "Failed to move to astronaut after " + LOOP_MAX + " retries. Reporting rounding completion anyway.");
+        } else {
+            Log.i(TAG, "Successfully moved to astronaut's position.");
+        }
+        api.reportRoundingCompletion();
+        Log.i(TAG, "Reported rounding completion.");
+
+        /* --- Recognize Target Item from Astronaut --- */
+        Log.i(TAG, "Attempting to recognize target item from astronaut.");
+        // Area ID 5 is used for the astronaut's item/DockCam view in the original logic.
+        // Perform AR cropping for Area 5 (astronaut's view) to get the image for recognition.
+        ARResult astronautARResult = AR_cropping(5, 0); // 0 for normal mode
+
+        if (astronautARResult.arComplete == 0) {
+            Log.w(TAG, "AR detection and cropping failed for Astronaut's item area. Item recognition might fail.");
+        }
+
+        List<Object> astronautItemPrediction;
+        try {
+            astronautItemPrediction = wrapper_predict(5); // Recognize item held by astronaut
+            predictionOutput.add(astronautItemPrediction); // Add [itemName, itemCount] for astronaut's item (now index 4 in list)
+        } catch (IOException e) {
+            Log.e(TAG, "Error during TFLite prediction for Astronaut's item: " + e.getMessage());
+            // FIX: Explicitly cast to Object to resolve type inference issue with Arrays.asList
+            predictionOutput.add(Arrays.asList((Object)"Error", (Object)0));
+        }
+
+        api.notifyRecognitionItem(); // Notify the astronaut about the recognized item.
+        Log.i(TAG, "Notified recognition item.");
+
+        /* --- Move to Target Item Location and Take Snapshot --- */
+        String astronautTargetItem = "Not Found";
+        if (predictionOutput.size() > 4 && predictionOutput.get(4) != null && predictionOutput.get(4).size() >= 1) {
+            astronautTargetItem = (String) predictionOutput.get(4).get(0);
+            Log.i(TAG, "Astronaut's target item identified as: " + astronautTargetItem);
+        } else {
+            Log.e(TAG, "Could not determine astronaut's target item. Defaulting to 'Not Found'.");
+        }
+
+        Point finalTargetItemPoint = coordinateDictionary.get(1); // Default to Area 1
+        Quaternion finalTargetItemQuaternion = quaternionOrientations.get(1); // Default orientation
+
+        boolean targetAreaFound = false;
+        int bestAreaIdForTarget = -1;
+
+        // Iterate through the patrol areas (indexes 0-3 in predictionOutput) to find the target item.
+        for (int i = 0; i < patrolAreas.length; i++) {
+            int currentPatrolAreaId = patrolAreas[i];
+            List<Object> areaData = predictionOutput.get(i);
+
+            if (areaData != null && areaData.size() >= 2) {
+                String detectedItemInArea = (String) areaData.get(0);
+                Integer itemCountInArea = (Integer) areaData.get(1);
+
+                // Check if the detected item matches the astronaut's target AND it was detected (count > 0).
+                if (Objects.equals(detectedItemInArea, astronautTargetItem) && itemCountInArea > 0) {
+                    bestAreaIdForTarget = currentPatrolAreaId;
+                    targetAreaFound = true;
+                    Log.i(TAG, "Found target item '" + astronautTargetItem + "' in Area " + bestAreaIdForTarget + " (count: " + itemCountInArea + ").");
+                    break; // Found it, no need to check other areas.
+                }
+            }
+        }
+
+        if (targetAreaFound && bestAreaIdForTarget != -1) {
+            finalTargetItemPoint = coordinateDictionary.get(bestAreaIdForTarget);
+            finalTargetItemQuaternion = quaternionOrientations.get(bestAreaIdForTarget);
+            Log.i(TAG, "Moving to identified target item location: Area " + bestAreaIdForTarget);
+        } else {
+            Log.e(TAG, "Target item '" + astronautTargetItem + "' not found or count was zero in any patrolled area. Moving to default Area 1.");
+            // Keep default Area 1 if target not found. You might want a more sophisticated fallback.
+        }
+
+        Log.i(TAG, "Attempting final move to target item location.");
+        loopCounter = 0;
+        result = api.moveTo(finalTargetItemPoint, finalTargetItemQuaternion, false);
+        while (!result.hasSucceeded() && loopCounter < LOOP_MAX) {
+            Log.w(TAG, "Move to final target item failed, retrying... Attempt " + (loopCounter + 1));
+            result = api.moveTo(finalTargetItemPoint, finalTargetItemQuaternion, false);
+            SystemClock.sleep(500);
+            loopCounter++;
+        }
+        if (!result.hasSucceeded()) {
+            Log.e(TAG, "Failed to move to final target item after " + LOOP_MAX + " retries. Cannot take snapshot.");
+            return;
+        }
+        Log.i(TAG, "Successfully moved to final target item location.");
+
+        api.takeTargetItemSnapshot();
+        Log.i(TAG, "Took target item snapshot. Mission completed.");
+
+        Log.i(TAG, "All tasks completed. Please verify logs and results.");
+    }
+
+    @Override
+    protected void runPlan2() {
+        // Implement your Plan 2 logic here if needed.
+    }
+
+    @Override
+    protected void runPlan3() {
+        // Implement your Plan 3 logic here if needed.
+    }
+
+    // You can add your method.
+    private String yourMethod(){
+        return "your method invoked";
+    }
+
+    // Helper for move with retries (from Thailand code)
+    private boolean moveToWrapper(double pos_x, double pos_y, double pos_z,
+                                  double qua_x, double qua_y, double qua_z,
+                                  double qua_w) {
+        final gov.nasa.arc.astrobee.types.Point point = new gov.nasa.arc.astrobee.types.Point(pos_x, pos_y, pos_z);
+        final gov.nasa.arc.astrobee.types.Quaternion quaternion = new Quaternion((float) qua_x, (float) qua_y,
+                (float) qua_z, (float) qua_w);
+
+        Result result = api.moveTo(point, quaternion, false);
+        int loopCounter = 0;
+        final int MAX_RETRY = 3;
+        while (!result.hasSucceeded() && loopCounter < MAX_RETRY) {
+            Log.w(TAG, "moveToWrapper failed to move to (" + pos_x + "," + pos_y + "," + pos_z + "), retrying... Attempt " + (loopCounter + 1));
+            result = api.moveTo(point, quaternion, false);
+            SystemClock.sleep(500);
+            loopCounter++;
+        }
+        return result.hasSucceeded();
+    }
+
+    // Helper for move with retries (Point & Quaternion) (from Thailand code)
+    private boolean moveToWrapper( gov.nasa.arc.astrobee.types.Point positionMap,  gov.nasa.arc.astrobee.types.Quaternion QuaternionMap ) {
+        Result result = api.moveTo(positionMap, QuaternionMap, false);
+        int loopCounter = 0;
+        final int MAX_RETRY = 3;
+        while (!result.hasSucceeded() && loopCounter < MAX_RETRY) {
+            Log.w(TAG, "moveToWrapper failed to move to " + positionMap.toString() + ", retrying... Attempt " + (loopCounter + 1));
+            result = api.moveTo(positionMap, QuaternionMap, false);
+            loopCounter++;
+            SystemClock.sleep(500);
+        }
+        return result.hasSucceeded();
+    }
+
+
+    // ARResult class (from Thailand code)
+    public static class ARResult {
+        public int arComplete;
+        public int detectedIdsCount;
+
+        public ARResult(int arComplete, int detectedIdsCount) {
+            this.arComplete = arComplete;
+            this.detectedIdsCount = detectedIdsCount;
+        }
+    }
+
+    // AR_cropping method (from Thailand code, adapted)
+    public ARResult AR_cropping (int target_num, int emr){
+        // Initial call, starting with 0 retries
+        return AR_cropping(target_num, emr, 0);
+    }
+
+    /**
+     * Internal recursive helper for AR_cropping with a retry counter.
+     */
+    private ARResult AR_cropping(int target_num, int emr, int retryCount) {
+        final int MAX_AR_RETRY_ATTEMPTS = 2; // Includes initial attempt (0) + 1 retry. So total 2 tries.
+        if (retryCount >= MAX_AR_RETRY_ATTEMPTS) {
+            Log.e(TAG, "AR_cropping: Max retries (" + MAX_AR_RETRY_ATTEMPTS + ") reached for target_num " + target_num + ". Aborting.");
+            return new ARResult(0, 0); // Indicate failure
+        }
+
+        int ar_complete = 0; // 0 indicates failure, target_num indicates success
+
+        // Initialize Mats to null for safe release in finally block
+        Mat kernel = null;
+        Mat cameraMatrix = null;
+        Mat dstMatrix = null;
+        Mat src = null;
+        Mat undistort = null;
+        Mat sharpened = null;
+        Mat ids = null;
+        List<Mat> corners = null;
+        Mat rotationMatrix = null;
+        Mat rotatedImage = null;
+        Mat croppedImage = null;
+
+        try {
+            kernel = new Mat(3, 3, CvType.CV_32F);
+            // Corrected kernel initialization (using put with a single double for each element)
+            kernel.put(0, 0, 0.0); kernel.put(0, 1, -1.0); kernel.put(0, 2, 0.0);
+            kernel.put(1, 0, -1.0); kernel.put(1, 1, 5.0); kernel.put(1, 2, -1.0);
+            kernel.put(2, 0, 0.0); kernel.put(2, 1, -1.0); kernel.put(2, 2, 0.0);
+
+            double[][] cameraParam = api.getNavCamIntrinsics(); // Get NavCam intrinsics
+            if (cameraParam == null || cameraParam.length < 2 || cameraParam[0] == null || cameraParam[1] == null ||
+                    cameraParam[0].length < 9 || cameraParam[1].length < 5) {
+                Log.e(TAG, "AR_cropping: Failed to get valid camera intrinsics. Cannot undistort.");
+                return new ARResult(0, 0);
+            }
+
+            cameraMatrix = new Mat(3, 3, CvType.CV_64FC1); // Use CV_64FC1 for double[][]
+            dstMatrix = new Mat(1, 5, CvType.CV_64FC1);
+            cameraMatrix.put(0, 0, cameraParam[0]); // Populate camera matrix
+            dstMatrix.put(0, 0, cameraParam[1]);   // Populate distortion coefficients
+
+            // Get source image based on target_num (DockCam for Area 5, NavCam for others)
+            src = (target_num == 5) ? api.getMatDockCam() : api.getMatNavCam();
+
+            if (src == null || src.empty()) {
+                Log.e(TAG, "AR_cropping: Source image is null or empty for target_num " + target_num + " at retry " + retryCount + ".");
+                return new ARResult(0, 0); // No image, cannot proceed
+            }
+
+            undistort = new Mat();
+            sharpened = new Mat();
+            Calib3d.undistort(src, undistort, cameraMatrix, dstMatrix);
+
+            if (emr == 1) { // If in emergency mode, use original (src) as undistorted (or a copy)
+                src.copyTo(undistort); // Use a copy of the raw image if undistortion is problematic
+                Log.i(TAG, "AR_cropping: Operating in emergency mode. Undistortion skipped.");
+            }
+            Imgproc.filter2D(undistort, sharpened, -1, kernel); // Apply sharpening filter
+
+            // Save the sharpened image for debugging
+            api.saveMatImage(sharpened, "Pre-" + target_num + ".png");
+
+            // Detect AR markers
+            Dictionary arucoDict = Aruco.getPredefinedDictionary(Aruco.DICT_5X5_250);
+            ids = new Mat();
+            corners = new ArrayList<>();
+            Aruco.detectMarkers(sharpened, arucoDict, corners, ids);
+            Log.i(TAG, "AR_cropping: Detected IDs count: " + (ids.empty() ? 0 : ids.rows()) + " for target_num " + target_num + " at retry " + retryCount + "."); // Check if ids is empty before rows()
+
+            if (!corners.isEmpty() && !ids.empty()) {
+                float markerLength = 0.05f; // Standard marker length
+
+                int selectedIndex = 0;
+                // Logic to select a specific AR tag if multiple are present, based on Y-coordinate.
+                if (corners.size() > 1) {
+                    // Check if the first corner's data is valid before accessing
+                    if (corners.get(0) != null && !corners.get(0).empty() && corners.get(0).rows() > 0 && corners.get(0).cols() > 1 && corners.get(0).get(0, 1) != null) {
+                        double selectedY = corners.get(0).get(0, 1)[1]; // Y-coordinate of the first corner
+                        for (int i = 1; i < corners.size(); i++) {
+                            if (corners.get(i) != null && !corners.get(i).empty() && corners.get(i).rows() > 0 && corners.get(i).cols() > 1 && corners.get(i).get(0, 1) != null) {
+                                double y = corners.get(i).get(0, 1)[1];
+                                // Custom logic for selecting AR tag based on area (e.g., target 2 selects higher Y, target 3 selects lower Y)
+                                if ((target_num == 2 && y > selectedY) || (target_num == 3 && y < selectedY)) {
+                                    selectedY = y;
+                                    selectedIndex = i;
+                                }
+                            } else {
+                                Log.w(TAG, "AR_cropping: Invalid corner data at index " + i + " during selection.");
+                            }
+                        }
+                    } else {
+                        Log.w(TAG, "AR_cropping: First corner data is invalid during selection.");
+                    }
+                }
+
+                Mat selectedCorner = corners.get(selectedIndex);
+                List<Mat> selectedCorners = new ArrayList<>();
+                selectedCorners.add(selectedCorner);
+
+                // Estimate pose (rvecs: rotation vectors, tvecs: translation vectors)
+                Mat rvecs = new Mat();
+                Mat tvecs = new Mat();
+                Aruco.estimatePoseSingleMarkers(selectedCorners, markerLength, cameraMatrix, dstMatrix, rvecs, tvecs);
+                rvecs.release(); // Release these Mats as they are not used further
+                tvecs.release();
+
+                MatOfPoint2f cornerPoints = new MatOfPoint2f(selectedCorner);
+                org.opencv.core.Point[] cornerArray = cornerPoints.toArray();
+                cornerPoints.release(); // Release this Mat after converting to array
+
+                // Calculate average pixel distance for marker side length
+                double pixelDistance = (Core.norm(new MatOfPoint2f(cornerArray[0]), new MatOfPoint2f(cornerArray[1])) +
+                        Core.norm(new MatOfPoint2f(cornerArray[0]), new MatOfPoint2f(cornerArray[3])) +
+                        Core.norm(new MatOfPoint2f(cornerArray[1]), new MatOfPoint2f(cornerArray[2])) +
+                        Core.norm(new MatOfPoint2f(cornerArray[2]), new MatOfPoint2f(cornerArray[3]))) / 4.0;
+                double pixelToMRatio = (pixelDistance == 0) ? 0 : pixelDistance / markerLength;
+
+                // Calculate rotation angle and center for image rectification (making the marker horizontal)
+                double angle = Math.atan2(cornerArray[0].y - cornerArray[1].y, cornerArray[0].x - cornerArray[1].x);
+                double angleDegrees = Math.toDegrees(angle);
+                org.opencv.core.Point center = new org.opencv.core.Point((cornerArray[0].x + cornerArray[2].x) / 2, (cornerArray[0].y + cornerArray[2].y) / 2);
+
+                rotationMatrix = Imgproc.getRotationMatrix2D(center, angleDegrees, 1.0);
+                rotatedImage = new Mat();
+                Imgproc.warpAffine(sharpened, rotatedImage, rotationMatrix, sharpened.size());
+
+                int centerX = (int) center.x;
+                int centerY = (int) center.y;
+                Log.i(TAG, "AR_cropping: Center X,Y for cropping: " + centerX + "," + centerY);
+
+                // Define crop offsets relative to the marker center (these are specific tuning parameters)
+                double TL = pixelToMRatio * 0.28;  // Top-Left X offset
+                double TR = pixelToMRatio * 0.015; // Top-Right X offset
+                double TH = pixelToMRatio * 0.06;  // Top Height Y offset
+                double BH = pixelToMRatio * 0.17;  // Bottom Height Y offset
+
+                int xMin = (int) (centerX - TL);
+                int yMin = (int) (centerY - TH);
+                int xMax = (int) (centerX + TR);
+                int yMax = (int) (centerY + BH);
+
+                // Ensure ROI is within image boundaries
+                xMin = Math.max(0, xMin);
+                yMin = Math.max(0, yMin);
+                xMax = Math.min(rotatedImage.width(), xMax);
+                yMax = Math.min(rotatedImage.height(), yMax);
+
+                // Check for valid ROI dimensions
+                if (xMax <= xMin || yMax <= yMin || (xMax - xMin) <= 0 || (yMax - yMin) <= 0) {
+                    Log.e(TAG, "AR_cropping: Invalid ROI dimensions calculated. Cannot crop. xMin=" + xMin + ", yMin=" + yMin + ", xMax=" + xMax + ", yMax=" + yMax);
+                    // This is a failure to crop, so retry or fail
+                    if (emr != 1) { // Only retry with emergency mode if not already in it
+                        return AR_cropping(target_num, 1, retryCount + 1);
+                    }
+                    return new ARResult(0, (ids.empty() ? 0 : ids.rows())); // Final failure
+                }
+
+                Rect roi = new Rect(xMin, yMin, xMax - xMin, yMax - yMin);
+                croppedImage = new Mat(rotatedImage, roi); // Create cropped image
+
+                ar_complete = target_num; // Indicate successful cropping
+                api.saveMatImage(croppedImage, "post_" + target_num + ".png"); // Save the cropped image
+
+                return new ARResult(ar_complete, (ids.empty() ? 0 : ids.rows()));
+
+            } else {
+                Log.w(TAG, "AR_cropping: No corners or IDs found for target_num " + target_num + " at retry " + retryCount + ".");
+                // Recursive call for retry, incrementing retryCount
+                return AR_cropping(target_num, (emr == 0 ? 1 : emr), retryCount + 1);
+            }
+        } catch (CvException e) {
+            Log.e(TAG, "AR_cropping: OpenCV error for target_num " + target_num + " at retry " + retryCount + ": " + e.getMessage());
+            e.printStackTrace();
+            return new ARResult(0, 0); // Indicate failure due to OpenCV error
+        } catch (Exception e) {
+            Log.e(TAG, "AR_cropping: Unexpected error for target_num " + target_num + " at retry " + retryCount + ": " + e.getMessage());
+            e.printStackTrace();
+            return new ARResult(0, 0); // Indicate failure due to other exceptions
+        } finally {
+            // Ensure all Mat objects are released to prevent memory leaks
+            if (kernel != null) kernel.release();
+            if (cameraMatrix != null) cameraMatrix.release();
+            if (dstMatrix != null) dstMatrix.release();
+            if (src != null) src.release();
+            if (undistort != null) undistort.release();
+            if (sharpened != null) sharpened.release();
+            if (ids != null) ids.release();
+            if (corners != null) {
+                for (Mat c : corners) {
+                    if (c != null) c.release();
+                }
+            }
+            if (rotationMatrix != null) rotationMatrix.release();
+            if (rotatedImage != null) rotatedImage.release();
+            if (croppedImage != null) croppedImage.release();
+        }
+    }
+
+
+    // BoundingBoxWithScore class (from Thailand code)
+    public static class BoundingBoxWithScore {
+        private final RectF rect;
+        private final float score;
+        private final String category;
+
+        public BoundingBoxWithScore(RectF rect, float score, String category) {
+            this.rect = rect;
+            this.score = score;
+            this.category = category;
+        }
+
+        public RectF getRect() {
+            return rect;
+        }
+
+        public float getScore() {
+            return score;
+        }
+
+        public String getCategory() {
+            return category;
+        }
+    }
+
+    // NonMaxSuppression class (from Thailand code)
+    public static class NonMaxSuppression {
+        public static List<BoundingBoxWithScore> softNonMaxSuppression(List<BoundingBoxWithScore> boundingBoxes, float iouThreshold, float scoreThreshold, float sigma, float imageWidth, float imageHeight, float margin, int maxResults) {
+            // Sort bounding boxes by score in descending order
+            // Using anonymous inner class for Java 7 compatibility as lambda is Java 8+
+            Collections.sort(boundingBoxes, new Comparator<BoundingBoxWithScore>() {
+                @Override
+                public int compare(BoundingBoxWithScore b1, BoundingBoxWithScore b2) {
+                    return Float.compare(b2.getScore(), b1.getScore());
+                }
+            });
+
+            List<BoundingBoxWithScore> selectedBoxes = new ArrayList<>();
+            // Use boolean array or ArrayList<Boolean> for suppression tracking
+            boolean[] suppressed = new boolean[boundingBoxes.size()]; // Initialize to false
+
+            for (int i = 0; i < boundingBoxes.size() && selectedBoxes.size() < maxResults; i++) {
+                if (suppressed[i]) { // Check the boolean array
+                    continue;
+                }
+
+                BoundingBoxWithScore currentBox = boundingBoxes.get(i);
+                selectedBoxes.add(currentBox);
+
+                for (int j = i + 1; j < boundingBoxes.size(); j++) {
+                    if (suppressed[j]) { // Check the boolean array
+                        continue;
+                    }
+
+                    BoundingBoxWithScore otherBox = boundingBoxes.get(j);
+                    float iou = calculateIoU(currentBox.getRect(), otherBox.getRect());
+
+                    if (iou > iouThreshold) {
+                        float weight = (float) Math.exp(-(iou * iou) / sigma);
+                        float newScore = otherBox.getScore() * weight;
+                        if (newScore < scoreThreshold) {
+                            suppressed[j] = true; // Mark for suppression
+                        }
+                    }
+                }
+            }
+            return selectedBoxes;
+        }
+
+        private static float calculateIoU(RectF rect1, RectF rect2) {
+            float intersectionLeft = Math.max(rect1.left, rect2.left);
+            float intersectionTop = Math.max(rect1.top, rect2.top);
+            float intersectionRight = Math.min(rect1.right, rect2.right);
+            float intersectionBottom = Math.min(rect1.bottom, rect2.bottom);
+
+            if (intersectionRight < intersectionLeft || intersectionBottom < intersectionTop) {
+                return 0.0f; // No intersection
+            }
+
+            float intersectionArea = (intersectionRight - intersectionLeft) * (intersectionBottom - intersectionTop);
+            float unionArea = (rect1.width() * rect1.height()) + (rect2.width() * rect2.height()) - intersectionArea;
+
+            if (unionArea == 0.0f) {
+                return 0.0f; // Avoid division by zero
+            }
+
+            return intersectionArea / unionArea;
+        }
+    }
+
+
+    // wrapper_predict method (from Thailand code, adapted)
+    public List<Object> wrapper_predict(int numberImage) throws IOException {
+        String defaultFile = getImagePath(numberImage);
+        File imageFile = new File(defaultFile);
+        File modelFile = getModelFile(numberImage);
+
+        List<Object> output = new ArrayList<>();
+        float threshold = 0.3f; // Default threshold, can be adjusted
+        ObjectDetector.ObjectDetectorOptions options = modelConfig(threshold);
+        ObjectDetector detector = null;
+
+        if (!modelFile.exists()) {
+            Log.e(TAG, "Model file does not exist: " + modelFile.getAbsolutePath());
+            output.add("Error: Model Missing");
+            output.add(0);
+            return output;
+        }
+        try {
+            detector = ObjectDetector.createFromFileAndOptions(modelFile, options);
+        } catch (IOException e) {
+            Log.e(TAG, "Failed to create ObjectDetector from file: " + modelFile.getName() + " - " + e.getMessage());
+            output.add("Error: Detector Init Failed");
+            output.add(0);
+            return output;
+        }
+
+
+        if (!imageFile.exists()) {
+            handleMissingImage(numberImage, output);
+        } else {
+            Bitmap bitmap = loadBitmapFromSDCard(defaultFile);
+            if (bitmap == null) {
+                Log.e(TAG, "Failed to load bitmap from SD Card: " + defaultFile);
+                output.add("Error: Bitmap Load Failed");
+                output.add(0);
+                return output;
+            }
+            TensorImage imageTensor = TensorImage.fromBitmap(bitmap);
+            List<Detection> results = detector.detect(imageTensor);
+            processResults(results, bitmap, numberImage, threshold, output, options);
+            bitmap.recycle(); // Recycle bitmap after use
+        }
+        return output;
+    }
+
+    // getImagePath method (adapted for sampleapk's save path)
+    private String getImagePath(int numberImage) {
+        // Adjust this path if your saveMatImage saves to a different location.
+        // It's usually `jp.jaxa.iss.kibo.rpc.yourpackagename/files/DebugImages`
+        // Make sure your AndroidManifest.xml has WRITE_EXTERNAL_STORAGE permission if writing to /sdcard
+        return "/sdcard/data/jp.jaxa.iss.kibo.rpc.rmc/files/DebugImages/post_" + numberImage + ".png"; // Adjusted package name
+    }
+
+    // getModelFile method (from Thailand code, ensures model is accessible)
+    private File getModelFile(int numberImage) throws IOException {
+        String modelName = "";
+        // You need to replace "koonpolz5.tflite" and "koonpolz12.tflite"
+        // with the actual names of your TensorFlow Lite models in the assets folder.
+        // These models need to be placed in `app/src/main/assets` as well.
+        if (numberImage == 5) { // Assuming model for astronaut image
+            modelName = "koonpolz5.tflite"; // REPLACE WITH YOUR ACTUAL MODEL NAME, e.g., "koonpolz5.tflite"
+        } else { // Assuming model for area images
+            modelName = "koonpolz12.tflite"; // REPLACE WITH YOUR ACTUAL MODEL NAME, e.g., "koonpolz12.tflite"
+        }
+        return convertModelFileFromAssetsToTempFile(modelName);
+    }
+
+    // handleMissingImage method (from Thailand code)
+    private void handleMissingImage(int numberImage, List<Object> output) {
+        Log.e(TAG, "EMR(Image): Missing image file for number " + numberImage);
+        output.add("Not Found");
+        output.add(0);
+    }
+
+    // processResults method (from Thailand code)
+    private void processResults(List<Detection> results, Bitmap bitmap, int numberImage, float threshold, List<Object> output, ObjectDetector.ObjectDetectorOptions options) throws IOException {
+        if (results.isEmpty()) {
+            handleNoResults(numberImage, output, options, threshold);
+            return;
+        }
+
+        List<Object> filterResult = filter(results, bitmap, numberImage, threshold);
+        if (isReDetectionNeeded(filterResult)) {
+            Log.i(TAG, "Re-detection needed for image " + numberImage);
+            performReDetection(bitmap, output, options ,numberImage ,threshold);
+        } else {
+            output.add(filterResult.get(0));
+            output.add(filterResult.get(1));
+        }
+
+        Log.i(TAG, "Predicted: Have " + results.size() + " raw items.");
+        Log.i(TAG, "Predicted: Final filtered item(Result): " + output.toString());
+    }
+
+    // isReDetectionNeeded method (from Thailand code)
+    private boolean isReDetectionNeeded(List<Object> filterResult) {
+        if (filterResult.size() < 2 || !(filterResult.get(1) instanceof Integer)) {
+            Log.w(TAG, "isReDetectionNeeded: Filter result invalid size or type.");
+            return false;
+        }
+        // Check if exactly one detection AND that detection is NOT one of these specific items.
+        return ((Integer) filterResult.get(1)).equals(1) &&
+                filterResult.get(0) instanceof String && // Ensure it's a string before calling .contains
+                !Arrays.asList("watch", "top", "kapton_tape", "goggle", "beaker").contains(filterResult.get(0));
+    }
+
+    // performReDetection method (from Thailand code, adapted model name)
+    private void performReDetection(Bitmap bitmap, List<Object> output, ObjectDetector.ObjectDetectorOptions options ,int numberImage, float threshold) throws IOException {
+        File modelFile = convertModelFileFromAssetsToTempFile("koonpolz12.tflite"); // Use your area model for re-detection
+        ObjectDetector reDetector = null;
+        try {
+            reDetector = ObjectDetector.createFromFileAndOptions(modelFile, options);
+        } catch (IOException e) {
+            Log.e(TAG, "Failed to create reDetector from file: " + e.getMessage());
+            output.add("Error: ReDetector Init Failed");
+            output.add(0);
+            return;
+        }
+
+        List<Detection> newResults = reDetector.detect(TensorImage.fromBitmap(bitmap));
+
+        if (newResults.isEmpty()) {
+            output.add("Not Found");
+            output.add(0);
+            Log.i(TAG, "performReDetection: Re-detection yielded no results.");
+        } else {
+            List<Object> newFilterResult = filter(newResults, bitmap, numberImage, threshold);
+            output.add(newFilterResult.get(0));
+            output.add(newFilterResult.get(1));
+            Log.i(TAG, "performReDetection: Re-detection successful. Result: " + output.toString());
+        }
+    }
+
+    // handleNoResults method (from Thailand code, adapted model name)
+    private void handleNoResults(int numberImage, List<Object> output, ObjectDetector.ObjectDetectorOptions options, float threshold) throws IOException {
+        Log.i(TAG, "Predicted: No initial results found. Attempting fallback model.");
+        File modelFile;
+        modelFile = convertModelFileFromAssetsToTempFile("koonpolz5.tflite"); // Use your fallback model
+        String defaultFile = getImagePath(numberImage);
+
+        ObjectDetector detector = null;
+        try {
+            detector = ObjectDetector.createFromFileAndOptions(modelFile, options);
+        } catch (IOException e) {
+            Log.e(TAG, "Failed to create fallback ObjectDetector: " + e.getMessage());
+            output.add("Error: Fallback Detector Init Failed");
+            output.add(0);
+            return;
+        }
+
+        Bitmap bitmap = loadBitmapFromSDCard(defaultFile);
+        if (bitmap == null) {
+            Log.e(TAG, "Fallback: Failed to load bitmap from SD Card: " + defaultFile);
+            output.add("Error: Fallback Bitmap Load Failed");
+            output.add(0);
+            return;
+        }
+        TensorImage imageTensor = TensorImage.fromBitmap(bitmap);
+        List<Detection> results = detector.detect(imageTensor);
+        if (results.isEmpty()) {
+            output.add("Not Found");
+            output.add(0);
+            Log.i(TAG, "handleNoResults: Fallback detection also yielded no results.");
+        } else {
+            List<Object> newFilterResult = filter(results, bitmap, numberImage, threshold);
+            output.add(newFilterResult.get(0));
+            output.add(newFilterResult.get(1));
+            Log.i(TAG, "handleNoResults: Fallback detection successful. Result: " + output.toString());
+        }
+        bitmap.recycle();
+    }
+
+    // modelConfig method (from Thailand code)
+    private ObjectDetector.ObjectDetectorOptions modelConfig(float threshold) {
+        return ObjectDetector.ObjectDetectorOptions.builder()
+                .setScoreThreshold(threshold)
+                .build();
+    }
+
+    // filter method (from Thailand code)
+    public List<Object> filter(List<Detection> results, Bitmap image, int number_image, float threshold){
+        List<Object> output = new ArrayList<>();
+        List<BoundingBoxWithScore> boundScoreList = new ArrayList<>();
+        for (Detection detection : results) {
+            String classidtest = detection.getCategories().get(0).getLabel();
+            RectF boundingBox = detection.getBoundingBox();
+            float score = detection.getCategories().get(0).getScore();
+            Log.i(TAG, "Predicted: bounding box: " + boundingBox.toShortString()); // Use toShortString() for cleaner log
+            Log.i(TAG, "Predicted: Class_named: " + classidtest);
+            boundScoreList.add(new BoundingBoxWithScore(boundingBox, score, classidtest));
+        }
+
+        // Draw all raw bounding boxes (before NMS) for debugging
+        Bitmap resultImage = drawBoundingBoxes(image, boundScoreList);
+        api.saveBitmapImage(resultImage,"before_iou_"+number_image+".png");
+        resultImage.recycle(); // Recycle bitmap
+
+        float imageWidth = image.getWidth();
+        float imageHeight = image.getHeight();
+        float margin = 2.73f; // This value is from the original code, its purpose isn't immediately clear for NMS.
+
+        // Apply Soft Non-Maximum Suppression
+        // maxOutputSize (top 2 detections)
+        List<BoundingBoxWithScore> filteredResults = NonMaxSuppression.softNonMaxSuppression(boundScoreList, 0.34f, 0.6f,0.2f, imageWidth, imageHeight, margin,2);
+
+        if (!filteredResults.isEmpty()) {
+            String topCategory = filteredResults.get(0).getCategory();
+            int count = filteredResults.size(); // Count of distinct detections after NMS
+            output.add(topCategory);
+            output.add(count);
+            Log.i(TAG, "Filter: Top Category: " + topCategory);
+            Log.i(TAG, "Filter: Total filtered items: " + count);
+        } else {
+            output.add("Not Found");
+            output.add(0);
+            Log.i(TAG, "Filter: No filtered results found.");
+        }
+
+        // Draw filtered bounding boxes (after NMS) for debugging
+        Bitmap resultImage1 = drawBoundingBoxes(image, filteredResults);
+        api.saveBitmapImage(resultImage1,"after_iou_"+number_image+".png");
+        resultImage1.recycle(); // Recycle bitmap
+
+        return output;
+    }
+
+    // drawBoundingBoxes method (from Thailand code)
+    public Bitmap drawBoundingBoxes(Bitmap bitmap, List<BoundingBoxWithScore> boundingBoxes) {
+        Bitmap mutableBitmap = bitmap.copy(Bitmap.Config.ARGB_8888, true); // Use ARGB_8844 for compatibility
+        Canvas canvas = new Canvas(mutableBitmap);
+        Paint paint = new Paint();
+        paint.setColor(Color.RED);
+        paint.setStyle(Paint.Style.STROKE);
+        paint.setStrokeWidth(3.0f);
+
+        for (BoundingBoxWithScore bbox : boundingBoxes) {
+            canvas.drawRect(bbox.getRect(), paint);
+        }
+
+        return mutableBitmap;
+    }
+
+    // convertModelFileFromAssetsToTempFile method (from Thailand code)
+    private File convertModelFileFromAssetsToTempFile(String modelFileName) throws IOException {
+        File tempFile = null;
+        try (InputStream inputStream = getAssets().open(modelFileName)) {
+            // Create temp file with a proper suffix and prefix, modelFileName might contain dots.
+            String prefix = modelFileName.substring(0, modelFileName.lastIndexOf('.'));
+            String suffix = modelFileName.substring(modelFileName.lastIndexOf('.'));
+            tempFile = File.createTempFile(prefix, suffix);
+
+            tempFile.deleteOnExit(); // Delete the temporary file when the JVM exits
+
+            try (FileOutputStream outputStream = new FileOutputStream(tempFile)) {
+                byte[] buffer = new byte[4 * 1024]; // 4K buffer
+                int bytesRead;
+                while ((bytesRead = inputStream.read(buffer)) != -1) {
+                    outputStream.write(buffer, 0, bytesRead);
+                }
+            }
+            return tempFile;
+        } catch (IOException e) {
+            Log.e(TAG, "Failed to convert model file from assets: " + modelFileName + " - " + e.getMessage());
+            if (tempFile != null) tempFile.delete(); // Ensure cleanup on error
+            throw e; // Re-throw to indicate failure
+        }
+    }
+
+    // loadBitmapFromSDCard method (from Thailand code)
+    public static Bitmap loadBitmapFromSDCard(String filePath) {
+        File imgFile = new File(filePath);
+        if (imgFile.exists()) {
+            return BitmapFactory.decodeFile(imgFile.getAbsolutePath());
+        }
+        Log.e("LoadBitmap", "Bitmap file does not exist: " + filePath);
+        return null;
+    }
+
+    // Quaternion conversion methods (from Thailand code)
+    public Quaternion computeQuaternionFromAngles(List<Double> degrees) {
+        // This method from Thailand's code is problematic as QuaternionUtils is undefined.
+        // It's likely a custom utility they had.
+        // For now, let's use the eulerToQuaternion method that is defined below.
+        Log.w(TAG, "Using eulerToQuaternion fallback for computeQuaternionFromAngles. Ensure correct angle order (yaw, pitch, roll).");
+        return eulerToQuaternion(degrees);
+    }
+
+    public  Quaternion eulerToQuaternion_use(double x, double y, double z) {
+        double yaw = Math.toRadians(z);
+        double pitch = Math.toRadians(y);
+        double roll = Math.toRadians(x);
+
+        double cy = Math.cos(yaw * 0.5);
+        double sy = Math.sin(yaw * 0.5);
+        double cp = Math.cos(pitch * 0.5);
+        double sp = Math.sin(pitch * 0.5);
+        double cr = Math.cos(roll * 0.5);
+        double sr = Math.sin(roll * 0.5);
+
+        double qx = sr * cp * cy - cr * sp * sy;
+        double qy = cr * sp * cy + sr * cp * sy;
+        double qz = cr * cp * sy - sr * sp * cy;
+        double qw = cr * cp * cy + sr * sp * sy;
+
+        return new Quaternion((float) qx, (float) qy, (float) qz, (float) qw);
+    }
+
+    private Quaternion eulerToQuaternion(List<Double> degree) {
+        if (degree == null || degree.size() < 3) {
+            Log.e(TAG, "eulerToQuaternion: Invalid degree list. Expected 3 angles (yaw, pitch, roll).");
+            return new Quaternion(0f, 0f, 0f, 1f); // Return identity quaternion
+        }
+        // Assuming degree list is [yaw, pitch, roll]
+        double yaw = Math.toRadians(degree.get(0));
+        double pitch = Math.toRadians(degree.get(1));
+        double roll = Math.toRadians(degree.get(2));
+
+        double cy = Math.cos(yaw * 0.5);
+        double sy = Math.sin(yaw * 0.5);
+        double cp = Math.cos(pitch * 0.5);
+        double sp = Math.sin(pitch * 0.5);
+        double cr = Math.cos(roll * 0.5);
+        double sr = Math.sin(roll * 0.5);
+
+        double qx = sr * cp * cy - cr * sp * sy;
+        double qy = cr * sp * cy + sr * cp * sy;
+        double qz = cr * cp * sy - sr * sp * cy;
+        double qw = cr * cp * cy + sr * sp * sy;
+
+        return new Quaternion((float) qx, (float) qy, (float) qz, (float) qw);
+    }
+
+    // Final_turn method (from Thailand code)
+    private List<Double> Final_turn(int target_num, int emr) {
+        // boolean check = false; // This variable is not used in the method's logic.
+        int center_x = 0;
+        int center_y = 0;
+        double pixelToMRatio = 0; // Initialize to 0 to prevent division by zero
+
+        // Initialize all Mats to null for safe release in finally block
+        Mat kernel = null;
+        Mat cameraMatrix = null;
+        Mat dstMatrix = null;
+        Mat src = null;
+        Mat undistort = null;
+        Mat sharpened = null;
+        Mat ids = null;
+        List<Mat> corners = null;
+
+        try {
+            kernel = new Mat(3, 3, CvType.CV_32F);
+            kernel.put(0, 0, 0.0); kernel.put(0, 1, -1.0); kernel.put(0, 2, 0.0);
+            kernel.put(1, 0, -1.0); kernel.put(1, 1, 5.0); kernel.put(1, 2, -1.0);
+            kernel.put(2, 0, 0.0); kernel.put(2, 1, -1.0); kernel.put(2, 2, 0.0);
+
+            double[][] cameraParam = api.getNavCamIntrinsics();
+            if (cameraParam == null || cameraParam.length < 2 || cameraParam[0] == null || cameraParam[1] == null ||
+                    cameraParam[0].length < 9 || cameraParam[1].length < 5) {
+                Log.e(TAG, "Final_turn: Failed to get valid camera intrinsics. Cannot process.");
+                return Arrays.asList(0.0, 0.0, 0.0);
+            }
+
+            cameraMatrix = new Mat(3, 3, CvType.CV_64FC1);
+            dstMatrix = new Mat(1, 5, CvType.CV_64FC1);
+            cameraMatrix.put(0, 0, cameraParam[0]);
+            dstMatrix.put(0, 0, cameraParam[1]);
+
+            src = api.getMatNavCam(); // Get image from NavCam
+            if (src == null || src.empty()) {
+                Log.e(TAG, "Final_turn: Source image is null or empty. Cannot process.");
+                return Arrays.asList(0.0, 0.0, 0.0);
+            }
+
+            undistort = new Mat();
+            sharpened = new Mat();
+            Calib3d.undistort(src, undistort, cameraMatrix, dstMatrix);
+
+            if (emr == 1) { // If in emergency mode, use original (src) as undistorted
+                src.copyTo(undistort); // Make a copy if using src directly
+                // check = true; // Not used
+                Log.i(TAG, "Final_turn: Operating in emergency mode. Undistortion skipped.");
+            }
+            Imgproc.filter2D(undistort, sharpened, -1, kernel); // Apply sharpening
+
+            api.saveMatImage(sharpened, "Final" + target_num + ".png"); // Save for debugging
+
+            // Detect AR markers
+            Dictionary arucoDict = Aruco.getPredefinedDictionary(Aruco.DICT_5X5_250);
+            ids = new Mat();
+            corners = new ArrayList<>();
+            Aruco.detectMarkers(sharpened, arucoDict, corners, ids);
+
+            if (!corners.isEmpty() && !ids.empty()) {
+                // check = true; // Not used
+                float markerLength = 0.05f;
+
+                int selectedIndex = 0;
+                // Select specific AR tag if multiple.
+                if (corners.size() > 0 && corners.get(0) != null && !corners.get(0).empty() && corners.get(0).rows() >= 1 && corners.get(0).cols() >= 2 && corners.get(0).get(0,1) != null) {
+                    double selectedY = corners.get(0).get(0, 1)[1];
+                    for (int i = 1; i < corners.size(); i++) {
+                        if (corners.get(i) != null && !corners.get(i).empty() && corners.get(i).rows() >= 1 && corners.get(i).cols() >= 2 && corners.get(i).get(0,1) != null) {
+                            double y = corners.get(i).get(0, 1)[1];
+                            if ((target_num == 2 && y > selectedY) || (target_num == 3 && y < selectedY)) {
+                                selectedY = y;
+                                selectedIndex = i;
+                            }
+                        } else {
+                            Log.w(TAG, "Final_turn: Invalid corner data at index " + i + " during selection.");
+                        }
+                    }
+                } else {
+                    Log.w(TAG, "Final_turn: No valid corners found for selection. Using selectedIndex = 0.");
+                }
+
+                Mat selectedCorner = corners.get(selectedIndex);
+                List<Mat> selectedCorners = new ArrayList<>();
+                selectedCorners.add(selectedCorner);
+
+                // Estimate pose to get translation vectors (tvecs)
+                Mat rvecs = new Mat();
+                Mat tvecs = new Mat();
+                Aruco.estimatePoseSingleMarkers(selectedCorners, markerLength, cameraMatrix, dstMatrix, rvecs, tvecs);
+                rvecs.release(); // Release these as they are not used for center calculation
+                tvecs.release();
+
+                MatOfPoint2f cornerPoints = new MatOfPoint2f(selectedCorner);
+                org.opencv.core.Point[] cornerArray = cornerPoints.toArray();
+                cornerPoints.release();
+
+                double pixelDistance = (Core.norm(new MatOfPoint2f(cornerArray[0]), new MatOfPoint2f(cornerArray[1])) +
+                        Core.norm(new MatOfPoint2f(cornerArray[0]), new MatOfPoint2f(cornerArray[3])) +
+                        Core.norm(new MatOfPoint2f(cornerArray[1]), new MatOfPoint2f(cornerArray[2])) +
+                        Core.norm(new MatOfPoint2f(cornerArray[2]), new MatOfPoint2f(cornerArray[3]))) / 4.0;
+                pixelToMRatio = (pixelDistance == 0) ? 0 : pixelDistance / markerLength;
+
+                org.opencv.core.Point center = new org.opencv.core.Point((cornerArray[0].x + cornerArray[2].x) / 2, (cornerArray[0].y + cornerArray[2].y) / 2);
+                center_x = (int) center.x;
+                center_y = (int) center.y;
+                Log.i(TAG, "Final_turn: AR marker center X,Y: " + center_x + "," + center_y);
+
+            } else if (emr != 1) { // No AR markers found and not in emergency mode, try emergency mode
+                Log.w(TAG, "Final_turn: No corners or IDs found. Retrying in emergency mode.");
+                return Final_turn(target_num, 1); // Recursive call
+            } else {
+                Log.e(TAG, "Final_turn: No AR markers found after retries. Cannot calculate angles.");
+                return Arrays.asList(0.0, 0.0, 0.0); // Return default angles on final failure
+            }
+
+            List<Double> changeAngle = new ArrayList<>();
+            double changeof_y = 0.0;
+            double changeof_x = 0.0;
+            Kinematics kinematics = api.getRobotKinematics();
+            gov.nasa.arc.astrobee.types.Point pos_as = kinematics.getPosition();
+
+            if (pixelToMRatio == 0) {
+                Log.e(TAG, "Final_turn: pixelToMRatio is zero. Cannot calculate angle changes. Returning default.");
+                return Arrays.asList(0.0, 0.0, 0.0);
+            }
+
+            // Calculations for angle adjustments based on camera's view of the AR marker.
+            if (target_num == 3) {
+                changeof_y = Math.atan(((640.0 - center_x) / pixelToMRatio) / (pos_as.getZ() - 3.76093)) * 57.296;
+                changeof_x = (Math.atan(((480.0 - center_y) / pixelToMRatio) / (pos_as.getZ() - 3.76093)) * 57.296) * 0.75;
+                changeAngle.add(0.0 + changeof_x); // Roll
+                changeAngle.add(75.0 + changeof_y); // Pitch
+                changeAngle.add(90.0); // Yaw
+            } else if (target_num == 1) {
+                changeof_y = Math.atan(((640.0 - center_x) / pixelToMRatio) / (pos_as.getY() + 10.58)) * 57.296;
+                changeof_x = (Math.atan(((480.0 - center_y) / pixelToMRatio) / (pos_as.getY() + 10.58)) * 57.296)*0.75;
+                changeAngle.add(-90.000 - changeof_y);
+                changeAngle.add(-25.000 + changeof_x);
+                changeAngle.add(0.000);
+            } else if (target_num == 2) {
+                changeof_y = Math.atan(((640.0 - center_x) / pixelToMRatio) / (pos_as.getZ() - 3.76203)) * 57.296;
+                changeof_x = (Math.atan(((480.0 - center_y) / pixelToMRatio) / (pos_as.getZ() - 3.76203)) * 57.296) * 0.75;
+                changeAngle.add(0.0 + changeof_x);
+                changeAngle.add(90.0 + changeof_y);
+                changeAngle.add(90.0);
+            } else if (target_num == 5) { // DockCam/Astronaut view
+                changeof_y = Math.atan(((640.0 - center_x) / pixelToMRatio) / (pos_as.getZ() - 3.76093)) * 57.296;
+                changeof_x = (Math.atan(((480.0 - center_y) / pixelToMRatio) / (pos_as.getZ() - 3.76093)) * 57.296) * 0.75;
+                changeAngle.add(0.0 + changeof_x);
+                changeAngle.add(90.0 + changeof_y);
+                changeAngle.add(90.0);
+            } else if (target_num == 4) {
+                changeof_y = Math.atan(((480.0 - center_y) / pixelToMRatio) / (pos_as.getX() - 9.866984)) * 57.296;
+                changeof_x = (Math.atan(((640.0 - center_x) / pixelToMRatio) / (pos_as.getX() - 9.866984)) * 57.296)*0.75;
+                changeAngle.add(-180.000 - changeof_x);
+                changeAngle.add(0.0 - changeof_y);
+                changeAngle.add(0.0);
+            } else {
+                Log.e(TAG, "Final_turn: Unknown target_num: " + target_num + ". Returning default angles.");
+                changeAngle.add(0.0);
+                changeAngle.add(0.0);
+                changeAngle.add(0.0);
+            }
+            return changeAngle;
+
+        } catch (CvException e) {
+            Log.e(TAG, "Final_turn: OpenCV error: " + e.getMessage());
+            e.printStackTrace();
+            return Arrays.asList(0.0, 0.0, 0.0);
+        } catch (Exception e) {
+            Log.e(TAG, "Final_turn: Unexpected error: " + e.getMessage());
+            e.printStackTrace();
+            return Arrays.asList(0.0, 0.0, 0.0);
+        } finally {
+            // Ensure all Mat objects are released
+            if (kernel != null) kernel.release();
+            if (cameraMatrix != null) cameraMatrix.release();
+            if (dstMatrix != null) dstMatrix.release();
+            if (src != null) src.release();
+            if (undistort != null) undistort.release();
+            if (sharpened != null) sharpened.release();
+            if (ids != null) ids.release();
+            if (corners != null) {
+                for (Mat c : corners) {
+                    if (c != null) c.release();
+                }
+            }
+        }
+    }
+
+    // Helper methods (from your original SampleApk code)
+    // Resize image
+    private Mat resizeImg (Mat img, int width) {
+        if (img == null || img.empty()) {
+            Log.e(TAG, "Input image for resizeImg is null or empty.");
+            return new Mat();
+        }
+        int height = (int) (img.rows() * ((double) width / img.cols()));
+        if (height <= 0 || width <= 0) {
+            Log.e(TAG, "Calculated dimensions for resizeImg are invalid: width=" + width + ", height=" + height);
+            return new Mat();
+        }
+        Mat resizedImg = new Mat();
+        Imgproc.resize(img, resizedImg, new Size(width, height));
+        return resizedImg;
+    }
+
+    // Rotate image
+    private Mat rotImg(Mat img, int angle) {
+        if (img == null || img.empty()) {
+            Log.e(TAG, "Input image for rotImg is null or empty.");
+            return new Mat();
+        }
+        org.opencv.core.Point center = new org.opencv.core.Point(img.cols() / 2.0, img.rows() / 2.0);
+        Mat rotatedMat = Imgproc.getRotationMatrix2D(center, angle, 1.0);
+        Mat rotatedImg = new Mat();
+        Imgproc.warpAffine(img, rotatedImg, rotatedMat, img.size());
+        rotatedMat.release();
+        return rotatedImg;
+    }
+
+    // Remove multiple detections (This method is not used in TFLite approach's `filter` method)
+    private List<org.opencv.core.Point> removeDuplicates(List<org.opencv.core.Point> points) {
+        double minDistance = 10;
+        List<org.opencv.core.Point> filteredList = new ArrayList<>();
+
+        for (org.opencv.core.Point point : points) {
+            boolean isDuplicate = false;
+            for (org.opencv.core.Point existingPoint : filteredList) {
+                double distance = calculateDistance(point, existingPoint);
+                if (distance <= minDistance) {
+                    isDuplicate = true;
+                    break;
+                }
+            }
+            if (!isDuplicate) {
+                filteredList.add(point);
+            }
+        }
+        return filteredList;
+    }
+
+    // Find the distance between two points (Used by removeDuplicates)
+    private double calculateDistance(org.opencv.core.Point p1, org.opencv.core.Point p2) {
+        double dx = p1.x - p2.x;
+        double dy = p1.y - p2.y;
+        return Math.sqrt(Math.pow(dx, 2) + Math.pow(dy, 2));
+    }
+
+    // Get the maximum value of an array (Not used in TFLite approach's `filter` method)
+    private int getMaxIndex(int[] array) {
+        if (array == null || array.length == 0) {
+            return -1;
+        }
+        int max = array[0];
+        int maxIndex = 0;
+
+        for (int i = 1; i < array.length; i++) {
+            if (array[i] > max) {
+                max = array[i];
+                maxIndex = i;
+            }
+        }
+        return maxIndex;
+    }
+
+    // From Thailand coding: Additional helper methods that were in runPlan1 but are better as separate methods
+    private double check_pos(){
+        double distance = 0.0;
+        Kinematics kinematics = api.getRobotKinematics();
+        gov.nasa.arc.astrobee.types.Point pos = kinematics.getPosition();
+        distance = Math.sqrt((Math.pow(11.143 - pos.getX(), 2)) + (Math.pow(-6.7607 - pos.getY(), 2)) + (Math.pow(4.9654 - pos.getZ(), 2)));
+        Log.i(TAG, "distance_to_as: " + distance);
+        return distance;
+    }
+
+    private boolean check_con(int target){
+        boolean check = false;
+        Kinematics kinematics = api.getRobotKinematics();
+        gov.nasa.arc.astrobee.types.Point pos = kinematics.getPosition();
+        if(target == 99){
+            if(pos.getY() < -9.68 && pos.getZ() > 4.2){
+                check = true;
+            }
+        }
+        Log.i(TAG, "check_con: " + check);
+        return check;
+    }
+
+
+    // These methods provide more complex mission flow logic that might be triggered based on TFLite output.
+    // They are not directly called in the main runPlan1 loop in this simplified version,
+    // but they are present in the original Thailand code and can be reintegrated if needed.
+    private void report(List<List<Object>> output, Map<Integer ,gov.nasa.arc.astrobee.types.Point> dictionary,List<List<Double>> angle_list){
+        int foundTarget = 0;
+        List<Integer> notFoundTarget= new ArrayList<>();
+        int NotFoundCount = NotFoundCheck(output);
+
+        for (int areaK = 0; areaK < 4; areaK++) {
+            String currentItem = (String) output.get(areaK).get(0);
+            String targetItem = (String) output.get(4).get(0); // Assuming index 4 is astronaut's item
+
+            if (Objects.equals(currentItem, targetItem)) {
+                logAndMove(areaK,dictionary,angle_list);
+                foundTarget = 1;
+                api.takeTargetItemSnapshot();
+                break;
+            } else if ("Not Found".equals(currentItem)) {
+                notFoundTarget.add(areaK);
+                logNotFound(areaK, currentItem);
+            }
+        }
+
+        if (foundTarget == 0) {
+            if (NotFoundCount == 1){
+                handleNotFound(notFoundTarget,dictionary,angle_list);
+            }
+            else{
+                goNearestArea(notFoundTarget,dictionary,angle_list);
+            }
+        }
+    }
+    private int NotFoundCheck(List<List<Object>> output){
+        int NotFoundcount = 0;
+
+        for (int areaK = 0; areaK < 4; areaK++) {
+            String currentItem = (String) output.get(areaK).get(0);
+
+            if ("Not Found".equals(currentItem)) {
+                NotFoundcount++;
+            }
+        }
+        for (int areaK = 0; areaK < 4; areaK++) {
+            String currentItem = (String) output.get(areaK).get(0);
+            String targetItem = (String) output.get(4).get(0);
+
+            if (Objects.equals(currentItem, targetItem)){
+                NotFoundcount++;
+            }
+        }
+        return NotFoundcount;
+    }
+    private void handleAstroError(List<List<Object>> output, Map<Integer ,gov.nasa.arc.astrobee.types.Point> dictionary,List<List<Double>> angle_list){
+
+        moveToWrapper(dictionary.get(4), eulerToQuaternion(angle_list.get(3)));
+        Mat image7 = api.getMatNavCam();
+        api.saveMatImage(image7, "target.png");
+        image7.release();
+        Mat image8 = api.getMatNavCam();
+        api.saveMatImage(image8, "LOCKON.png");
+        image8.release();
+    }
+    private void handleRepetitiveObj(List<List<Object>> output, Map<Integer ,gov.nasa.arc.astrobee.types.Point> dictionary,List<List<Double>> angle_list){
+        List<Integer> RepetitiveObj= new ArrayList<>();
+        for (int areaK = 0; areaK < 4; areaK++) {
+            String currentItem = (String) output.get(areaK).get(0);
+            String targetItem = (String) output.get(4).get(0);
+            if (Objects.equals(currentItem, targetItem)) {
+                RepetitiveObj.add(areaK);
+            }
+        }
+        goNearestArea(RepetitiveObj,dictionary,angle_list);
+    }
+    private int MoreThanOne(List<List<Object>> output){
+        int count = 0;
+        if (output.size() < 5) {
+            Log.e(TAG, "MoreThanOne: Output list size is too small for target item check.");
+            return 2;
+        }
+        String targetItem = (String) output.get(4).get(0);
+
+        for (int areaK = 0; areaK < 4; areaK++) {
+            String currentItem = (String) output.get(areaK).get(0);
+            if (Objects.equals(currentItem, targetItem)){
+                count++;
+            }
+        }
+        Log.i(TAG, "counting: Same_Count for target item: "+count);
+        if(count == 1){
+            return 0;
+        }
+        else if(count > 1){
+            return 1;
+        }
+        else{
+            return 2;
+        }
+    }
+    private void logAndMove(int areaK , Map<Integer ,gov.nasa.arc.astrobee.types.Point> dictionary,List<List<Double>> angle_list) {
+        Log.i(TAG, "Predict_result: item_index :" + areaK);
+
+        Mat image7 = api.getMatNavCam();
+        api.saveMatImage(image7, "target.png");
+        image7.release();
+
+        if (areaK + 1 == 1) {
+            moveToWrapper(dictionary.get(99), eulerToQuaternion(angle_list.get(areaK)));
+        }
+        moveToWrapper(dictionary.get(areaK + 1), eulerToQuaternion(angle_list.get(areaK)));
+        if(check_pos() < 0.4){
+            moveToWrapper(11.15d,-7.55d,5.25d,0f, 0f, -0.707f, 0.707f);
+            if (areaK + 1 == 1) {
+                moveToWrapper(dictionary.get(2), eulerToQuaternion(angle_list.get(areaK)));
+            }
+            if (areaK + 1 == 3) {
+                areaK = 4;
+            }
+            moveToWrapper(dictionary.get(areaK + 1), eulerToQuaternion(angle_list.get(areaK)));
+        }
+        Kinematics pos_now = api.getRobotKinematics();
+        Log.i(TAG, "Confident_main: " + String.valueOf(pos_now.getConfidence()));
+        Log.i(TAG, "Position: " + String.valueOf(pos_now.getPosition()));
+        SystemClock.sleep(3000);
+
+        moveToWrapper(dictionary.get(areaK + 1), computeQuaternionFromAngles(Final_turn(areaK + 1,0)));
+        Mat image8 = api.getMatNavCam();
+        api.saveMatImage(image8, "LOCKON.png");
+        image8.release();
+    }
+
+    private void logNotFound(int areaK, String currentItem) {
+        Log.i(TAG, "Predict_result: Not Found for area " + areaK);
+        Log.i(TAG, "Predict_result: current_item: " + currentItem);
+    }
+
+    private void handleNotFound(List<Integer> notFoundTarget ,Map<Integer, gov.nasa.arc.astrobee.types.Point> dictionary,List<List<Double>> angle_list) {
+        Mat image7 = api.getMatNavCam();
+        api.saveMatImage(image7, "target.png");
+        image7.release();
+        int targetAreaIndex = notFoundTarget.isEmpty() ? -1 : notFoundTarget.get(0);
+        if (targetAreaIndex != -1) {
+            int targetDictKey = targetAreaIndex + 1;
+
+            if (targetDictKey == 1) {
+                moveToWrapper(dictionary.get(99), eulerToQuaternion(angle_list.get(targetAreaIndex)));
+            }
+            moveToWrapper(dictionary.get(targetDictKey), eulerToQuaternion(angle_list.get(targetAreaIndex)));
+
+            if(check_pos() < 0.4) {
+                moveToWrapper(11.15d,-7.55d,5.25d,0f, 0f, -0.707f, 0.707f);
+                if (targetDictKey == 1) {
+                    moveToWrapper(dictionary.get(2), eulerToQuaternion(angle_list.get(targetAreaIndex)));
+                }
+                if(targetAreaIndex == 2){
+                    targetDictKey = 4;
+                }
+                moveToWrapper(dictionary.get(targetDictKey), eulerToQuaternion(angle_list.get(targetDictKey -1)));
+            }
+            Kinematics pos_now = api.getRobotKinematics();
+            Log.i(TAG, "Confident_main: " + String.valueOf(pos_now.getConfidence()));
+            Log.i(TAG, "Position: " + String.valueOf(pos_now.getPosition()));
+            SystemClock.sleep(3000);
+
+            moveToWrapper(dictionary.get(targetDictKey), computeQuaternionFromAngles(Final_turn(targetDictKey,0)));
+            Mat image8 = api.getMatNavCam();
+            api.saveMatImage(image8, "LOCKON.png");
+            image8.release();
+            api.takeTargetItemSnapshot();
+        } else {
+            Log.e(TAG, "handleNotFound: No target areas in notFoundTarget list.");
+        }
+    }
+
+
+    private void goNearestArea(List<Integer> notFoundTarget ,Map<Integer, gov.nasa.arc.astrobee.types.Point> dictionary,List<List<Double>> angle_list){
+        if (notFoundTarget.isEmpty()) {
+            Log.e(TAG, "goNearestArea: notFoundTarget list is empty. Cannot determine nearest area.");
+            return;
+        }
+        int lastIndex = notFoundTarget.get(notFoundTarget.size() - 1);
+
+        Mat image7 = api.getMatNavCam();
+        api.saveMatImage(image7, "target.png");
+        image7.release();
+
+        int targetDictKey = lastIndex + 1;
+
+        if (targetDictKey == 1) {
+            moveToWrapper(dictionary.get(99), eulerToQuaternion(angle_list.get(lastIndex)));
+        }
+        moveToWrapper(dictionary.get(targetDictKey), eulerToQuaternion(angle_list.get(lastIndex)));
+        if(check_pos() < 0.4) {
+            moveToWrapper(11.15d,-7.55d,5.25d,0f, 0f, -0.707f, 0.707f);
+            if (targetDictKey == 1) {
+                moveToWrapper(dictionary.get(2), eulerToQuaternion(angle_list.get(lastIndex)));
+            }
+            if(targetDictKey == 3){
+                targetDictKey = 4;
+            }
+            moveToWrapper(dictionary.get(targetDictKey), eulerToQuaternion(angle_list.get(targetDictKey - 1)));
+        }
+        Kinematics pos_now = api.getRobotKinematics();
+        Log.i(TAG, "Confident_main: " + String.valueOf(pos_now.getConfidence()));
+        Log.i(TAG, "Position: " + String.valueOf(pos_now.getPosition()));
+        SystemClock.sleep(3000);
+        moveToWrapper(dictionary.get(targetDictKey), computeQuaternionFromAngles(Final_turn(targetDictKey,0)));
+        Mat image8 = api.getMatNavCam();
+        api.saveMatImage(image8, "LOCKON.png");
+        image8.release();
+        api.takeTargetItemSnapshot();
+    }
+
+
+    public List<Double> stab(int target_num, int emr) {
+        List<Double> changeAngle = new ArrayList<>();
+        if (target_num == 3) {
+            changeAngle.add(0.0);
+            changeAngle.add(75.0);
+            changeAngle.add(90.0);
+        }else if(target_num == 1){
+            changeAngle.add(-90.000);
+            changeAngle.add(-25.000);
+            changeAngle.add(0.000);
+        }else if(target_num == 2){
+            changeAngle.add(0.000);
+            changeAngle.add(90.0);
+            changeAngle.add(90.0);
+        }
+        else if(target_num == 5){
+            changeAngle.add(0.000);
+            changeAngle.add(90.0);
+            changeAngle.add(90.0);
+        }else if(target_num == 4){
+            changeAngle.add(-180.000);
+            changeAngle.add(0.0);
+            changeAngle.add(0.0);
+        } else {
+            Log.w(TAG, "stab: Unknown target_num " + target_num + ". Returning default angles.");
+            changeAngle.add(0.0);
+            changeAngle.add(0.0);
+            changeAngle.add(0.0);
+        }
+        return changeAngle;
+    }
+}
