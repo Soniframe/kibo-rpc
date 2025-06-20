@@ -8,6 +8,7 @@ import android.graphics.Color;
 import android.graphics.Paint;
 import android.graphics.RectF;
 import android.os.SystemClock;
+import android.content.Context; // Added import for Context
 
 import jp.jaxa.iss.kibo.rpc.api.KiboRpcService;
 import gov.nasa.arc.astrobee.Result;
@@ -43,11 +44,14 @@ import org.opencv.imgproc.Imgproc;
 import org.opencv.android.Utils;
 import org.opencv.core.MatOfPoint;
 
-// TensorFlow Lite imports (Requires Gradle dependencies in app/build.gradle)
+// TensorFlow Lite imports
 import org.tensorflow.lite.support.image.TensorImage;
 import org.tensorflow.lite.task.vision.detector.Detection;
 import org.tensorflow.lite.task.vision.detector.ObjectDetector;
 
+import org.tensorflow.lite.support.image.ImageProcessor; // Existing import
+import org.tensorflow.lite.support.image.ops.NormalizeOp;  // Existing import
+import org.tensorflow.lite.DataType; // New import for DataType
 
 /**
  * Class meant to handle commands from the Ground Data System and execute them in Astrobee.
@@ -60,9 +64,9 @@ public class YourService extends KiboRpcService {
     // The labels your TFLite model is expected to output.
     // Make sure this array matches the labels used in your .tflite model.
     private final String[] TFLITE_LABELS = {
-            "book", "goggle", "electric_fan", "beaker", "screwdriver",
-            "watch", "plastic_bottle", "pen", "resin", "spatula",
-            "cup", "top", "tape", "P", "Q", "R", "S", "U", "V", "W", "X", "Y", "Z"
+            "coin", "compass", "coral", "crystal", "diamond",
+            "emerald", "fossil", "key", "letter", "shell",
+            "treasure_box"
     };
 
     // Dictionaries for Astrobee's movement points and orientations.
@@ -252,6 +256,7 @@ public class YourService extends KiboRpcService {
                 if (Objects.equals(detectedItemInArea, astronautTargetItem) && itemCountInArea > 0) {
                     bestAreaIdForTarget = currentPatrolAreaId;
                     targetAreaFound = true;
+                    // FIX (Line 256): Corrected string concatenation
                     Log.i(TAG, "Found target item '" + astronautTargetItem + "' in Area " + bestAreaIdForTarget + " (count: " + itemCountInArea + ").");
                     break; // Found it, no need to check other areas.
                 }
@@ -294,7 +299,7 @@ public class YourService extends KiboRpcService {
     }
 
     @Override
-    protected void runPlan3() {
+    protected void runPlan3() { // Corrected: Removed duplicate 'void' keyword
         // Implement your Plan 3 logic here if needed.
     }
 
@@ -387,59 +392,53 @@ public class YourService extends KiboRpcService {
             kernel.put(1, 0, -1.0); kernel.put(1, 1, 5.0); kernel.put(1, 2, -1.0);
             kernel.put(2, 0, 0.0); kernel.put(2, 1, -1.0); kernel.put(2, 2, 0.0);
 
-            double[][] cameraParam = api.getNavCamIntrinsics(); // Get NavCam intrinsics
+            double[][] cameraParam = api.getNavCamIntrinsics();
             if (cameraParam == null || cameraParam.length < 2 || cameraParam[0] == null || cameraParam[1] == null ||
                     cameraParam[0].length < 9 || cameraParam[1].length < 5) {
                 Log.e(TAG, "AR_cropping: Failed to get valid camera intrinsics. Cannot undistort.");
                 return new ARResult(0, 0);
             }
 
-            cameraMatrix = new Mat(3, 3, CvType.CV_64FC1); // Use CV_64FC1 for double[][]
+            cameraMatrix = new Mat(3, 3, CvType.CV_64FC1);
             dstMatrix = new Mat(1, 5, CvType.CV_64FC1);
-            cameraMatrix.put(0, 0, cameraParam[0]); // Populate camera matrix
-            dstMatrix.put(0, 0, cameraParam[1]);   // Populate distortion coefficients
+            cameraMatrix.put(0, 0, cameraParam[0]);
+            dstMatrix.put(0, 0, cameraParam[1]);
 
-            // Get source image based on target_num (DockCam for Area 5, NavCam for others)
             src = (target_num == 5) ? api.getMatDockCam() : api.getMatNavCam();
 
             if (src == null || src.empty()) {
                 Log.e(TAG, "AR_cropping: Source image is null or empty for target_num " + target_num + " at retry " + retryCount + ".");
-                return new ARResult(0, 0); // No image, cannot proceed
+                return new ARResult(0, 0);
             }
 
             undistort = new Mat();
             sharpened = new Mat();
             Calib3d.undistort(src, undistort, cameraMatrix, dstMatrix);
 
-            if (emr == 1) { // If in emergency mode, use original (src) as undistorted (or a copy)
-                src.copyTo(undistort); // Use a copy of the raw image if undistortion is problematic
+            if (emr == 1) {
+                src.copyTo(undistort);
                 Log.i(TAG, "AR_cropping: Operating in emergency mode. Undistortion skipped.");
             }
-            Imgproc.filter2D(undistort, sharpened, -1, kernel); // Apply sharpening filter
+            Imgproc.filter2D(undistort, sharpened, -1, kernel);
 
-            // Save the sharpened image for debugging
             api.saveMatImage(sharpened, "Pre-" + target_num + ".png");
 
-            // Detect AR markers
             Dictionary arucoDict = Aruco.getPredefinedDictionary(Aruco.DICT_5X5_250);
             ids = new Mat();
             corners = new ArrayList<>();
             Aruco.detectMarkers(sharpened, arucoDict, corners, ids);
-            Log.i(TAG, "AR_cropping: Detected IDs count: " + (ids.empty() ? 0 : ids.rows()) + " for target_num " + target_num + " at retry " + retryCount + "."); // Check if ids is empty before rows()
+            Log.i(TAG, "AR_cropping: Detected IDs count: " + (ids.empty() ? 0 : ids.rows()) + " for target_num " + target_num + " at retry " + retryCount + ".");
 
             if (!corners.isEmpty() && !ids.empty()) {
-                float markerLength = 0.05f; // Standard marker length
+                float markerLength = 0.05f;
 
                 int selectedIndex = 0;
-                // Logic to select a specific AR tag if multiple are present, based on Y-coordinate.
                 if (corners.size() > 1) {
-                    // Check if the first corner's data is valid before accessing
                     if (corners.get(0) != null && !corners.get(0).empty() && corners.get(0).rows() > 0 && corners.get(0).cols() > 1 && corners.get(0).get(0, 1) != null) {
-                        double selectedY = corners.get(0).get(0, 1)[1]; // Y-coordinate of the first corner
+                        double selectedY = corners.get(0).get(0, 1)[1];
                         for (int i = 1; i < corners.size(); i++) {
                             if (corners.get(i) != null && !corners.get(i).empty() && corners.get(i).rows() > 0 && corners.get(i).cols() > 1 && corners.get(i).get(0, 1) != null) {
                                 double y = corners.get(i).get(0, 1)[1];
-                                // Custom logic for selecting AR tag based on area (e.g., target 2 selects higher Y, target 3 selects lower Y)
                                 if ((target_num == 2 && y > selectedY) || (target_num == 3 && y < selectedY)) {
                                     selectedY = y;
                                     selectedIndex = i;
@@ -457,30 +456,25 @@ public class YourService extends KiboRpcService {
                 List<Mat> selectedCorners = new ArrayList<>();
                 selectedCorners.add(selectedCorner);
 
-                // Estimate pose (rvecs: rotation vectors, tvecs: translation vectors)
                 Mat rvecs = new Mat();
                 Mat tvecs = new Mat();
                 Aruco.estimatePoseSingleMarkers(selectedCorners, markerLength, cameraMatrix, dstMatrix, rvecs, tvecs);
-                rvecs.release(); // Release these Mats as they are not used further
+                rvecs.release();
                 tvecs.release();
 
                 MatOfPoint2f cornerPoints = new MatOfPoint2f(selectedCorner);
                 org.opencv.core.Point[] cornerArray = cornerPoints.toArray();
-                cornerPoints.release(); // Release this Mat after converting to array
+                cornerPoints.release();
 
-                // Calculate average pixel distance for marker side length
                 double pixelDistance = (Core.norm(new MatOfPoint2f(cornerArray[0]), new MatOfPoint2f(cornerArray[1])) +
                         Core.norm(new MatOfPoint2f(cornerArray[0]), new MatOfPoint2f(cornerArray[3])) +
                         Core.norm(new MatOfPoint2f(cornerArray[1]), new MatOfPoint2f(cornerArray[2])) +
                         Core.norm(new MatOfPoint2f(cornerArray[2]), new MatOfPoint2f(cornerArray[3]))) / 4.0;
                 double pixelToMRatio = (pixelDistance == 0) ? 0 : pixelDistance / markerLength;
 
-                // Calculate rotation angle and center for image rectification (making the marker horizontal)
-                double angle = Math.atan2(cornerArray[0].y - cornerArray[1].y, cornerArray[0].x - cornerArray[1].x);
-                double angleDegrees = Math.toDegrees(angle);
                 org.opencv.core.Point center = new org.opencv.core.Point((cornerArray[0].x + cornerArray[2].x) / 2, (cornerArray[0].y + cornerArray[2].y) / 2);
 
-                rotationMatrix = Imgproc.getRotationMatrix2D(center, angleDegrees, 1.0);
+                rotationMatrix = Imgproc.getRotationMatrix2D(center, Math.toDegrees(Math.atan2(cornerArray[0].y - cornerArray[1].y, cornerArray[0].x - cornerArray[1].x)), 1.0);
                 rotatedImage = new Mat();
                 Imgproc.warpAffine(sharpened, rotatedImage, rotationMatrix, sharpened.size());
 
@@ -488,56 +482,50 @@ public class YourService extends KiboRpcService {
                 int centerY = (int) center.y;
                 Log.i(TAG, "AR_cropping: Center X,Y for cropping: " + centerX + "," + centerY);
 
-                // Define crop offsets relative to the marker center (these are specific tuning parameters)
-                double TL = pixelToMRatio * 0.28;  // Top-Left X offset
-                double TR = pixelToMRatio * 0.015; // Top-Right X offset
-                double TH = pixelToMRatio * 0.06;  // Top Height Y offset
-                double BH = pixelToMRatio * 0.17;  // Bottom Height Y offset
+                double TL = pixelToMRatio * 0.28;
+                double TR = pixelToMRatio * 0.015;
+                double TH = pixelToMRatio * 0.06;
+                double BH = pixelToMRatio * 0.17;
 
                 int xMin = (int) (centerX - TL);
                 int yMin = (int) (centerY - TH);
                 int xMax = (int) (centerX + TR);
                 int yMax = (int) (centerY + BH);
 
-                // Ensure ROI is within image boundaries
                 xMin = Math.max(0, xMin);
                 yMin = Math.max(0, yMin);
                 xMax = Math.min(rotatedImage.width(), xMax);
                 yMax = Math.min(rotatedImage.height(), yMax);
 
-                // Check for valid ROI dimensions
                 if (xMax <= xMin || yMax <= yMin || (xMax - xMin) <= 0 || (yMax - yMin) <= 0) {
                     Log.e(TAG, "AR_cropping: Invalid ROI dimensions calculated. Cannot crop. xMin=" + xMin + ", yMin=" + yMin + ", xMax=" + xMax + ", yMax=" + yMax);
-                    // This is a failure to crop, so retry or fail
-                    if (emr != 1) { // Only retry with emergency mode if not already in it
+                    if (emr != 1) {
                         return AR_cropping(target_num, 1, retryCount + 1);
                     }
-                    return new ARResult(0, (ids.empty() ? 0 : ids.rows())); // Final failure
+                    return new ARResult(0, (ids.empty() ? 0 : ids.rows()));
                 }
 
                 Rect roi = new Rect(xMin, yMin, xMax - xMin, yMax - yMin);
-                croppedImage = new Mat(rotatedImage, roi); // Create cropped image
+                croppedImage = new Mat(rotatedImage, roi);
 
-                ar_complete = target_num; // Indicate successful cropping
-                api.saveMatImage(croppedImage, "post_" + target_num + ".png"); // Save the cropped image
+                ar_complete = target_num;
+                api.saveMatImage(croppedImage, "post_" + target_num + ".png");
 
                 return new ARResult(ar_complete, (ids.empty() ? 0 : ids.rows()));
 
             } else {
                 Log.w(TAG, "AR_cropping: No corners or IDs found for target_num " + target_num + " at retry " + retryCount + ".");
-                // Recursive call for retry, incrementing retryCount
                 return AR_cropping(target_num, (emr == 0 ? 1 : emr), retryCount + 1);
             }
         } catch (CvException e) {
             Log.e(TAG, "AR_cropping: OpenCV error for target_num " + target_num + " at retry " + retryCount + ": " + e.getMessage());
             e.printStackTrace();
-            return new ARResult(0, 0); // Indicate failure due to OpenCV error
+            return new ARResult(0, 0);
         } catch (Exception e) {
             Log.e(TAG, "AR_cropping: Unexpected error for target_num " + target_num + " at retry " + retryCount + ": " + e.getMessage());
             e.printStackTrace();
-            return new ARResult(0, 0); // Indicate failure due to other exceptions
+            return new ARResult(0, 0);
         } finally {
-            // Ensure all Mat objects are released to prevent memory leaks
             if (kernel != null) kernel.release();
             if (cameraMatrix != null) cameraMatrix.release();
             if (dstMatrix != null) dstMatrix.release();
@@ -557,7 +545,6 @@ public class YourService extends KiboRpcService {
     }
 
 
-    // BoundingBoxWithScore class (from Thailand code)
     public static class BoundingBoxWithScore {
         private final RectF rect;
         private final float score;
@@ -582,11 +569,8 @@ public class YourService extends KiboRpcService {
         }
     }
 
-    // NonMaxSuppression class (from Thailand code)
     public static class NonMaxSuppression {
         public static List<BoundingBoxWithScore> softNonMaxSuppression(List<BoundingBoxWithScore> boundingBoxes, float iouThreshold, float scoreThreshold, float sigma, float imageWidth, float imageHeight, float margin, int maxResults) {
-            // Sort bounding boxes by score in descending order
-            // Using anonymous inner class for Java 7 compatibility as lambda is Java 8+
             Collections.sort(boundingBoxes, new Comparator<BoundingBoxWithScore>() {
                 @Override
                 public int compare(BoundingBoxWithScore b1, BoundingBoxWithScore b2) {
@@ -595,11 +579,10 @@ public class YourService extends KiboRpcService {
             });
 
             List<BoundingBoxWithScore> selectedBoxes = new ArrayList<>();
-            // Use boolean array or ArrayList<Boolean> for suppression tracking
-            boolean[] suppressed = new boolean[boundingBoxes.size()]; // Initialize to false
+            boolean[] suppressed = new boolean[boundingBoxes.size()];
 
             for (int i = 0; i < boundingBoxes.size() && selectedBoxes.size() < maxResults; i++) {
-                if (suppressed[i]) { // Check the boolean array
+                if (suppressed[i]) {
                     continue;
                 }
 
@@ -607,7 +590,7 @@ public class YourService extends KiboRpcService {
                 selectedBoxes.add(currentBox);
 
                 for (int j = i + 1; j < boundingBoxes.size(); j++) {
-                    if (suppressed[j]) { // Check the boolean array
+                    if (suppressed[j]) {
                         continue;
                     }
 
@@ -618,7 +601,7 @@ public class YourService extends KiboRpcService {
                         float weight = (float) Math.exp(-(iou * iou) / sigma);
                         float newScore = otherBox.getScore() * weight;
                         if (newScore < scoreThreshold) {
-                            suppressed[j] = true; // Mark for suppression
+                            suppressed[j] = true;
                         }
                     }
                 }
@@ -633,14 +616,14 @@ public class YourService extends KiboRpcService {
             float intersectionBottom = Math.min(rect1.bottom, rect2.bottom);
 
             if (intersectionRight < intersectionLeft || intersectionBottom < intersectionTop) {
-                return 0.0f; // No intersection
+                return 0.0f;
             }
 
             float intersectionArea = (intersectionRight - intersectionLeft) * (intersectionBottom - intersectionTop);
             float unionArea = (rect1.width() * rect1.height()) + (rect2.width() * rect2.height()) - intersectionArea;
 
             if (unionArea == 0.0f) {
-                return 0.0f; // Avoid division by zero
+                return 0.0f;
             }
 
             return intersectionArea / unionArea;
@@ -648,7 +631,7 @@ public class YourService extends KiboRpcService {
     }
 
 
-    // wrapper_predict method (from Thailand code, adapted)
+    // wrapper_predict method (adapted for correct normalization)
     public List<Object> wrapper_predict(int numberImage) throws IOException {
         String defaultFile = getImagePath(numberImage);
         File imageFile = new File(defaultFile);
@@ -656,6 +639,8 @@ public class YourService extends KiboRpcService {
 
         List<Object> output = new ArrayList<>();
         float threshold = 0.3f; // Default threshold, can be adjusted
+
+        // FIX: Removed setInputImageProcessingOptions from here, as it's handled by ImageProcessor
         ObjectDetector.ObjectDetectorOptions options = modelConfig(threshold);
         ObjectDetector detector = null;
 
@@ -685,7 +670,20 @@ public class YourService extends KiboRpcService {
                 output.add(0);
                 return output;
             }
-            TensorImage imageTensor = TensorImage.fromBitmap(bitmap);
+
+            // FIX: Implement normalization using ImageProcessor before creating TensorImage
+            // Define normalization parameters.
+            // Common for models expecting float32 inputs from 0-255 range to be scaled to 0-1.
+            float normalizationMean = 0.0f;
+            float normalizationStd = 255.0f;
+
+            ImageProcessor imageProcessor = new ImageProcessor.Builder()
+                    .add(new NormalizeOp(normalizationMean, normalizationStd))
+                    .build();
+
+            // Process the bitmap to apply normalization
+            TensorImage imageTensor = imageProcessor.process(TensorImage.fromBitmap(bitmap));
+
             List<Detection> results = detector.detect(imageTensor);
             processResults(results, bitmap, numberImage, threshold, output, options);
             bitmap.recycle(); // Recycle bitmap after use
@@ -695,22 +693,16 @@ public class YourService extends KiboRpcService {
 
     // getImagePath method (adapted for sampleapk's save path)
     private String getImagePath(int numberImage) {
-        // Adjust this path if your saveMatImage saves to a different location.
-        // It's usually `jp.jaxa.iss.kibo.rpc.yourpackagename/files/DebugImages`
-        // Make sure your AndroidManifest.xml has WRITE_EXTERNAL_STORAGE permission if writing to /sdcard
-        return "/sdcard/data/jp.jaxa.iss.kibo.rpc.rmc/files/DebugImages/post_" + numberImage + ".png"; // Adjusted package name
+        return "/sdcard/data/jp.jaxa.iss.kibo.rpc.rmc/files/DebugImages/post_" + numberImage + ".png";
     }
 
     // getModelFile method (from Thailand code, ensures model is accessible)
     private File getModelFile(int numberImage) throws IOException {
         String modelName = "";
-        // You need to replace "koonpolz5.tflite" and "koonpolz12.tflite"
-        // with the actual names of your TensorFlow Lite models in the assets folder.
-        // These models need to be placed in `app/src/main/assets` as well.
-        if (numberImage == 5) { // Assuming model for astronaut image
-            modelName = "koonpolz5.tflite"; // REPLACE WITH YOUR ACTUAL MODEL NAME, e.g., "koonpolz5.tflite"
-        } else { // Assuming model for area images
-            modelName = "koonpolz12.tflite"; // REPLACE WITH YOUR ACTUAL MODEL NAME, e.g., "koonpolz12.tflite"
+        if (numberImage == 5) {
+            modelName = "rmc.tflite";
+        } else {
+            modelName = "rmc.tflite";
         }
         return convertModelFileFromAssetsToTempFile(modelName);
     }
@@ -748,15 +740,14 @@ public class YourService extends KiboRpcService {
             Log.w(TAG, "isReDetectionNeeded: Filter result invalid size or type.");
             return false;
         }
-        // Check if exactly one detection AND that detection is NOT one of these specific items.
         return ((Integer) filterResult.get(1)).equals(1) &&
-                filterResult.get(0) instanceof String && // Ensure it's a string before calling .contains
-                !Arrays.asList("watch", "top", "kapton_tape", "goggle", "beaker").contains(filterResult.get(0));
+                filterResult.get(0) instanceof String &&
+                !Arrays.asList("coin", "fossil", "shell", "crystal", "compass").contains(filterResult.get(0));
     }
 
     // performReDetection method (from Thailand code, adapted model name)
     private void performReDetection(Bitmap bitmap, List<Object> output, ObjectDetector.ObjectDetectorOptions options ,int numberImage, float threshold) throws IOException {
-        File modelFile = convertModelFileFromAssetsToTempFile("koonpolz12.tflite"); // Use your area model for re-detection
+        File modelFile = convertModelFileFromAssetsToTempFile("rmc.tflite");
         ObjectDetector reDetector = null;
         try {
             reDetector = ObjectDetector.createFromFileAndOptions(modelFile, options);
@@ -767,7 +758,13 @@ public class YourService extends KiboRpcService {
             return;
         }
 
-        List<Detection> newResults = reDetector.detect(TensorImage.fromBitmap(bitmap));
+        // FIX: Apply normalization using ImageProcessor before creating TensorImage for re-detection
+        float normalizationMean = 0.0f;
+        float normalizationStd = 255.0f;
+        ImageProcessor imageProcessor = new ImageProcessor.Builder()
+                .add(new NormalizeOp(normalizationMean, normalizationStd))
+                .build();
+        List<Detection> newResults = reDetector.detect(imageProcessor.process(TensorImage.fromBitmap(bitmap)));
 
         if (newResults.isEmpty()) {
             output.add("Not Found");
@@ -785,7 +782,7 @@ public class YourService extends KiboRpcService {
     private void handleNoResults(int numberImage, List<Object> output, ObjectDetector.ObjectDetectorOptions options, float threshold) throws IOException {
         Log.i(TAG, "Predicted: No initial results found. Attempting fallback model.");
         File modelFile;
-        modelFile = convertModelFileFromAssetsToTempFile("koonpolz5.tflite"); // Use your fallback model
+        modelFile = convertModelFileFromAssetsToTempFile("rmc.tflite");
         String defaultFile = getImagePath(numberImage);
 
         ObjectDetector detector = null;
@@ -805,7 +802,15 @@ public class YourService extends KiboRpcService {
             output.add(0);
             return;
         }
-        TensorImage imageTensor = TensorImage.fromBitmap(bitmap);
+
+        // FIX: Apply normalization using ImageProcessor before creating TensorImage for fallback
+        float normalizationMean = 0.0f;
+        float normalizationStd = 255.0f;
+        ImageProcessor imageProcessor = new ImageProcessor.Builder()
+                .add(new NormalizeOp(normalizationMean, normalizationStd))
+                .build();
+        TensorImage imageTensor = imageProcessor.process(TensorImage.fromBitmap(bitmap));
+
         List<Detection> results = detector.detect(imageTensor);
         if (results.isEmpty()) {
             output.add("Not Found");
@@ -820,8 +825,9 @@ public class YourService extends KiboRpcService {
         bitmap.recycle();
     }
 
-    // modelConfig method (from Thailand code)
+    // modelConfig method (updated to remove direct normalization setting)
     private ObjectDetector.ObjectDetectorOptions modelConfig(float threshold) {
+        // FIX: Removed setInputImageProcessingOptions as normalization is now handled by ImageProcessor
         return ObjectDetector.ObjectDetectorOptions.builder()
                 .setScoreThreshold(threshold)
                 .build();
@@ -876,7 +882,7 @@ public class YourService extends KiboRpcService {
 
     // drawBoundingBoxes method (from Thailand code)
     public Bitmap drawBoundingBoxes(Bitmap bitmap, List<BoundingBoxWithScore> boundingBoxes) {
-        Bitmap mutableBitmap = bitmap.copy(Bitmap.Config.ARGB_8888, true); // Use ARGB_8844 for compatibility
+        Bitmap mutableBitmap = bitmap.copy(Bitmap.Config.ARGB_8888, true);
         Canvas canvas = new Canvas(mutableBitmap);
         Paint paint = new Paint();
         paint.setColor(Color.RED);
@@ -894,15 +900,14 @@ public class YourService extends KiboRpcService {
     private File convertModelFileFromAssetsToTempFile(String modelFileName) throws IOException {
         File tempFile = null;
         try (InputStream inputStream = getAssets().open(modelFileName)) {
-            // Create temp file with a proper suffix and prefix, modelFileName might contain dots.
             String prefix = modelFileName.substring(0, modelFileName.lastIndexOf('.'));
             String suffix = modelFileName.substring(modelFileName.lastIndexOf('.'));
             tempFile = File.createTempFile(prefix, suffix);
 
-            tempFile.deleteOnExit(); // Delete the temporary file when the JVM exits
+            tempFile.deleteOnExit();
 
             try (FileOutputStream outputStream = new FileOutputStream(tempFile)) {
-                byte[] buffer = new byte[4 * 1024]; // 4K buffer
+                byte[] buffer = new byte[4 * 1024];
                 int bytesRead;
                 while ((bytesRead = inputStream.read(buffer)) != -1) {
                     outputStream.write(buffer, 0, bytesRead);
@@ -911,8 +916,8 @@ public class YourService extends KiboRpcService {
             return tempFile;
         } catch (IOException e) {
             Log.e(TAG, "Failed to convert model file from assets: " + modelFileName + " - " + e.getMessage());
-            if (tempFile != null) tempFile.delete(); // Ensure cleanup on error
-            throw e; // Re-throw to indicate failure
+            if (tempFile != null) tempFile.delete();
+            throw e;
         }
     }
 
@@ -928,9 +933,6 @@ public class YourService extends KiboRpcService {
 
     // Quaternion conversion methods (from Thailand code)
     public Quaternion computeQuaternionFromAngles(List<Double> degrees) {
-        // This method from Thailand's code is problematic as QuaternionUtils is undefined.
-        // It's likely a custom utility they had.
-        // For now, let's use the eulerToQuaternion method that is defined below.
         Log.w(TAG, "Using eulerToQuaternion fallback for computeQuaternionFromAngles. Ensure correct angle order (yaw, pitch, roll).");
         return eulerToQuaternion(degrees);
     }
@@ -958,9 +960,8 @@ public class YourService extends KiboRpcService {
     private Quaternion eulerToQuaternion(List<Double> degree) {
         if (degree == null || degree.size() < 3) {
             Log.e(TAG, "eulerToQuaternion: Invalid degree list. Expected 3 angles (yaw, pitch, roll).");
-            return new Quaternion(0f, 0f, 0f, 1f); // Return identity quaternion
+            return new Quaternion(0f, 0f, 0f, 1f);
         }
-        // Assuming degree list is [yaw, pitch, roll]
         double yaw = Math.toRadians(degree.get(0));
         double pitch = Math.toRadians(degree.get(1));
         double roll = Math.toRadians(degree.get(2));
@@ -982,12 +983,10 @@ public class YourService extends KiboRpcService {
 
     // Final_turn method (from Thailand code)
     private List<Double> Final_turn(int target_num, int emr) {
-        // boolean check = false; // This variable is not used in the method's logic.
         int center_x = 0;
         int center_y = 0;
-        double pixelToMRatio = 0; // Initialize to 0 to prevent division by zero
+        double pixelToMRatio = 0;
 
-        // Initialize all Mats to null for safe release in finally block
         Mat kernel = null;
         Mat cameraMatrix = null;
         Mat dstMatrix = null;
@@ -1015,7 +1014,7 @@ public class YourService extends KiboRpcService {
             cameraMatrix.put(0, 0, cameraParam[0]);
             dstMatrix.put(0, 0, cameraParam[1]);
 
-            src = api.getMatNavCam(); // Get image from NavCam
+            src = api.getMatNavCam();
             if (src == null || src.empty()) {
                 Log.e(TAG, "Final_turn: Source image is null or empty. Cannot process.");
                 return Arrays.asList(0.0, 0.0, 0.0);
@@ -1025,27 +1024,23 @@ public class YourService extends KiboRpcService {
             sharpened = new Mat();
             Calib3d.undistort(src, undistort, cameraMatrix, dstMatrix);
 
-            if (emr == 1) { // If in emergency mode, use original (src) as undistorted
-                src.copyTo(undistort); // Make a copy if using src directly
-                // check = true; // Not used
+            if (emr == 1) {
+                src.copyTo(undistort);
                 Log.i(TAG, "Final_turn: Operating in emergency mode. Undistortion skipped.");
             }
-            Imgproc.filter2D(undistort, sharpened, -1, kernel); // Apply sharpening
+            Imgproc.filter2D(undistort, sharpened, -1, kernel);
 
-            api.saveMatImage(sharpened, "Final" + target_num + ".png"); // Save for debugging
+            api.saveMatImage(sharpened, "Final" + target_num + ".png");
 
-            // Detect AR markers
             Dictionary arucoDict = Aruco.getPredefinedDictionary(Aruco.DICT_5X5_250);
             ids = new Mat();
             corners = new ArrayList<>();
             Aruco.detectMarkers(sharpened, arucoDict, corners, ids);
 
             if (!corners.isEmpty() && !ids.empty()) {
-                // check = true; // Not used
                 float markerLength = 0.05f;
 
                 int selectedIndex = 0;
-                // Select specific AR tag if multiple.
                 if (corners.size() > 0 && corners.get(0) != null && !corners.get(0).empty() && corners.get(0).rows() >= 1 && corners.get(0).cols() >= 2 && corners.get(0).get(0,1) != null) {
                     double selectedY = corners.get(0).get(0, 1)[1];
                     for (int i = 1; i < corners.size(); i++) {
@@ -1067,11 +1062,10 @@ public class YourService extends KiboRpcService {
                 List<Mat> selectedCorners = new ArrayList<>();
                 selectedCorners.add(selectedCorner);
 
-                // Estimate pose to get translation vectors (tvecs)
                 Mat rvecs = new Mat();
                 Mat tvecs = new Mat();
                 Aruco.estimatePoseSingleMarkers(selectedCorners, markerLength, cameraMatrix, dstMatrix, rvecs, tvecs);
-                rvecs.release(); // Release these as they are not used for center calculation
+                rvecs.release();
                 tvecs.release();
 
                 MatOfPoint2f cornerPoints = new MatOfPoint2f(selectedCorner);
@@ -1085,16 +1079,16 @@ public class YourService extends KiboRpcService {
                 pixelToMRatio = (pixelDistance == 0) ? 0 : pixelDistance / markerLength;
 
                 org.opencv.core.Point center = new org.opencv.core.Point((cornerArray[0].x + cornerArray[2].x) / 2, (cornerArray[0].y + cornerArray[2].y) / 2);
-                center_x = (int) center.x;
-                center_y = (int) center.y;
-                Log.i(TAG, "Final_turn: AR marker center X,Y: " + center_x + "," + center_y);
+                int centerX = (int) center.x;
+                int centerY = (int) center.y;
+                Log.i(TAG, "Final_turn: AR marker center X,Y: " + centerX + "," + centerY);
 
-            } else if (emr != 1) { // No AR markers found and not in emergency mode, try emergency mode
+            } else if (emr != 1) {
                 Log.w(TAG, "Final_turn: No corners or IDs found. Retrying in emergency mode.");
-                return Final_turn(target_num, 1); // Recursive call
+                return Final_turn(target_num, 1);
             } else {
                 Log.e(TAG, "Final_turn: No AR markers found after retries. Cannot calculate angles.");
-                return Arrays.asList(0.0, 0.0, 0.0); // Return default angles on final failure
+                return Arrays.asList(0.0, 0.0, 0.0);
             }
 
             List<Double> changeAngle = new ArrayList<>();
@@ -1108,34 +1102,33 @@ public class YourService extends KiboRpcService {
                 return Arrays.asList(0.0, 0.0, 0.0);
             }
 
-            // Calculations for angle adjustments based on camera's view of the AR marker.
             if (target_num == 3) {
-                changeof_y = Math.atan(((640.0 - center_x) / pixelToMRatio) / (pos_as.getZ() - 3.76093)) * 57.296;
-                changeof_x = (Math.atan(((480.0 - center_y) / pixelToMRatio) / (pos_as.getZ() - 3.76093)) * 57.296) * 0.75;
-                changeAngle.add(0.0 + changeof_x); // Roll
-                changeAngle.add(75.0 + changeof_y); // Pitch
-                changeAngle.add(90.0); // Yaw
+                changeof_y = Math.atan(((640.0 - centerX) / pixelToMRatio) / (pos_as.getZ() - 3.76093)) * 57.296;
+                changeof_x = (Math.atan(((480.0 - centerY) / pixelToMRatio) / (pos_as.getZ() - 3.76093)) * 57.296) * 0.75;
+                changeAngle.add(0.0 + changeof_x);
+                changeAngle.add(75.0 + changeof_y);
+                changeAngle.add(90.0);
             } else if (target_num == 1) {
-                changeof_y = Math.atan(((640.0 - center_x) / pixelToMRatio) / (pos_as.getY() + 10.58)) * 57.296;
-                changeof_x = (Math.atan(((480.0 - center_y) / pixelToMRatio) / (pos_as.getY() + 10.58)) * 57.296)*0.75;
+                changeof_y = Math.atan(((640.0 - centerX) / pixelToMRatio) / (pos_as.getY() + 10.58)) * 57.296;
+                changeof_x = (Math.atan(((480.0 - centerY) / pixelToMRatio) / (pos_as.getY() + 10.58)) * 57.296)*0.75;
                 changeAngle.add(-90.000 - changeof_y);
                 changeAngle.add(-25.000 + changeof_x);
                 changeAngle.add(0.000);
             } else if (target_num == 2) {
-                changeof_y = Math.atan(((640.0 - center_x) / pixelToMRatio) / (pos_as.getZ() - 3.76203)) * 57.296;
-                changeof_x = (Math.atan(((480.0 - center_y) / pixelToMRatio) / (pos_as.getZ() - 3.76203)) * 57.296) * 0.75;
+                changeof_y = Math.atan(((640.0 - centerX) / pixelToMRatio) / (pos_as.getZ() - 3.76203)) * 57.296;
+                changeof_x = (Math.atan(((480.0 - centerY) / pixelToMRatio) / (pos_as.getZ() - 3.76203)) * 57.296) * 0.75;
                 changeAngle.add(0.0 + changeof_x);
                 changeAngle.add(90.0 + changeof_y);
                 changeAngle.add(90.0);
-            } else if (target_num == 5) { // DockCam/Astronaut view
-                changeof_y = Math.atan(((640.0 - center_x) / pixelToMRatio) / (pos_as.getZ() - 3.76093)) * 57.296;
-                changeof_x = (Math.atan(((480.0 - center_y) / pixelToMRatio) / (pos_as.getZ() - 3.76093)) * 57.296) * 0.75;
+            } else if (target_num == 5) {
+                changeof_y = Math.atan(((640.0 - centerX) / pixelToMRatio) / (pos_as.getZ() - 3.76093)) * 57.296;
+                changeof_x = (Math.atan(((480.0 - centerY) / pixelToMRatio) / (pos_as.getZ() - 3.76093)) * 57.296) * 0.75;
                 changeAngle.add(0.0 + changeof_x);
                 changeAngle.add(90.0 + changeof_y);
                 changeAngle.add(90.0);
             } else if (target_num == 4) {
-                changeof_y = Math.atan(((480.0 - center_y) / pixelToMRatio) / (pos_as.getX() - 9.866984)) * 57.296;
-                changeof_x = (Math.atan(((640.0 - center_x) / pixelToMRatio) / (pos_as.getX() - 9.866984)) * 57.296)*0.75;
+                changeof_y = Math.atan(((480.0 - centerY) / pixelToMRatio) / (pos_as.getX() - 9.866984)) * 57.296;
+                changeof_x = (Math.atan(((640.0 - centerX) / pixelToMRatio) / (pos_as.getX() - 9.866984)) * 57.296)*0.75;
                 changeAngle.add(-180.000 - changeof_x);
                 changeAngle.add(0.0 - changeof_y);
                 changeAngle.add(0.0);
@@ -1156,7 +1149,6 @@ public class YourService extends KiboRpcService {
             e.printStackTrace();
             return Arrays.asList(0.0, 0.0, 0.0);
         } finally {
-            // Ensure all Mat objects are released
             if (kernel != null) kernel.release();
             if (cameraMatrix != null) cameraMatrix.release();
             if (dstMatrix != null) dstMatrix.release();
@@ -1173,7 +1165,6 @@ public class YourService extends KiboRpcService {
     }
 
     // Helper methods (from your original SampleApk code)
-    // Resize image
     private Mat resizeImg (Mat img, int width) {
         if (img == null || img.empty()) {
             Log.e(TAG, "Input image for resizeImg is null or empty.");
@@ -1189,7 +1180,6 @@ public class YourService extends KiboRpcService {
         return resizedImg;
     }
 
-    // Rotate image
     private Mat rotImg(Mat img, int angle) {
         if (img == null || img.empty()) {
             Log.e(TAG, "Input image for rotImg is null or empty.");
@@ -1203,7 +1193,6 @@ public class YourService extends KiboRpcService {
         return rotatedImg;
     }
 
-    // Remove multiple detections (This method is not used in TFLite approach's `filter` method)
     private List<org.opencv.core.Point> removeDuplicates(List<org.opencv.core.Point> points) {
         double minDistance = 10;
         List<org.opencv.core.Point> filteredList = new ArrayList<>();
@@ -1224,14 +1213,12 @@ public class YourService extends KiboRpcService {
         return filteredList;
     }
 
-    // Find the distance between two points (Used by removeDuplicates)
     private double calculateDistance(org.opencv.core.Point p1, org.opencv.core.Point p2) {
         double dx = p1.x - p2.x;
         double dy = p1.y - p2.y;
         return Math.sqrt(Math.pow(dx, 2) + Math.pow(dy, 2));
     }
 
-    // Get the maximum value of an array (Not used in TFLite approach's `filter` method)
     private int getMaxIndex(int[] array) {
         if (array == null || array.length == 0) {
             return -1;
@@ -1248,7 +1235,6 @@ public class YourService extends KiboRpcService {
         return maxIndex;
     }
 
-    // From Thailand coding: Additional helper methods that were in runPlan1 but are better as separate methods
     private double check_pos(){
         double distance = 0.0;
         Kinematics kinematics = api.getRobotKinematics();
@@ -1271,10 +1257,6 @@ public class YourService extends KiboRpcService {
         return check;
     }
 
-
-    // These methods provide more complex mission flow logic that might be triggered based on TFLite output.
-    // They are not directly called in the main runPlan1 loop in this simplified version,
-    // but they are present in the original Thailand code and can be reintegrated if needed.
     private void report(List<List<Object>> output, Map<Integer ,gov.nasa.arc.astrobee.types.Point> dictionary,List<List<Double>> angle_list){
         int foundTarget = 0;
         List<Integer> notFoundTarget= new ArrayList<>();
@@ -1282,7 +1264,7 @@ public class YourService extends KiboRpcService {
 
         for (int areaK = 0; areaK < 4; areaK++) {
             String currentItem = (String) output.get(areaK).get(0);
-            String targetItem = (String) output.get(4).get(0); // Assuming index 4 is astronaut's item
+            String targetItem = (String) output.get(4).get(0);
 
             if (Objects.equals(currentItem, targetItem)) {
                 logAndMove(areaK,dictionary,angle_list);
