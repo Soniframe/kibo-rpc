@@ -50,7 +50,7 @@ import org.tensorflow.lite.task.vision.detector.Detection;
 import org.tensorflow.lite.task.vision.detector.ObjectDetector;
 
 import org.tensorflow.lite.support.image.ImageProcessor; // Existing import
-import org.tensorflow.lite.support.image.ops.NormalizeOp;  // Existing import
+import org.tensorflow.lite.support.common.ops.NormalizeOp;  // Existing import
 import org.tensorflow.lite.DataType; // New import for DataType
 
 /**
@@ -983,8 +983,9 @@ public class YourService extends KiboRpcService {
 
     // Final_turn method (from Thailand code)
     private List<Double> Final_turn(int target_num, int emr) {
-        int center_x = 0;
-        int center_y = 0;
+        // Declare and initialize centerX and centerY at the beginning of the method
+        int centerX = 0;
+        int centerY = 0;
         double pixelToMRatio = 0;
 
         Mat kernel = null;
@@ -1079,8 +1080,8 @@ public class YourService extends KiboRpcService {
                 pixelToMRatio = (pixelDistance == 0) ? 0 : pixelDistance / markerLength;
 
                 org.opencv.core.Point center = new org.opencv.core.Point((cornerArray[0].x + cornerArray[2].x) / 2, (cornerArray[0].y + cornerArray[2].y) / 2);
-                int centerX = (int) center.x;
-                int centerY = (int) center.y;
+                centerX = (int) center.x; // Value assigned here
+                centerY = (int) center.y; // Value assigned here
                 Log.i(TAG, "Final_turn: AR marker center X,Y: " + centerX + "," + centerY);
 
             } else if (emr != 1) {
@@ -1102,6 +1103,7 @@ public class YourService extends KiboRpcService {
                 return Arrays.asList(0.0, 0.0, 0.0);
             }
 
+            // Now centerX and centerY are always defined here
             if (target_num == 3) {
                 changeof_y = Math.atan(((640.0 - centerX) / pixelToMRatio) / (pos_as.getZ() - 3.76093)) * 57.296;
                 changeof_x = (Math.atan(((480.0 - centerY) / pixelToMRatio) / (pos_as.getZ() - 3.76093)) * 57.296) * 0.75;
